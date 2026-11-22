@@ -360,3 +360,19 @@ enum unix_funcs
     aux_message,
     funcs_count
 };
+
+/* Madeira (iOS): upstream drivers run a stream's timer on a system thread they
+ * create themselves. A system thread has no TEB, which the iOS port cannot give
+ * a pseudo-process identity, so its driver (build/ntdll-unix/audio_null_ios.c
+ * in the Madeira repository) keeps the timer on a normal thread created by
+ * mmdevapi, as before Wine 11.5: its start call answers MADEIRA_S_PE_TIMER and
+ * mmdevapi then runs MADEIRA_UNIX_TIMER_LOOP, one call past the upstream table,
+ * on a thread of its own. No other driver answers that code, so nothing else
+ * ever makes the extra call. */
+#define MADEIRA_S_PE_TIMER      ((HRESULT)0x004d5054)
+#define MADEIRA_UNIX_TIMER_LOOP funcs_count
+
+struct madeira_timer_loop_params
+{
+    stream_handle stream;
+};

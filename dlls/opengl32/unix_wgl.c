@@ -476,7 +476,8 @@ static void init_client_context( TEB *teb, struct opengl_client_context *client,
     if (!device) device = (const char *)funcs->p_glGetString( GL_RENDERER );
     lstrcpynA( client->device_name, device, ARRAY_SIZE(client->device_name) );
 
-    if (is_win64 && is_wow64() && !initialize_vk_device( teb, ctx ) && !ctx->extensions[GL_AMD_pinned_memory])
+    if (is_win64 && is_wow64() && !ctx->extensions[GL_MESA_map_buffer_client_pointer] &&
+        !initialize_vk_device( teb, ctx ) && !ctx->extensions[GL_AMD_pinned_memory])
     {
         if (client->attrs.major > 4 || (client->attrs.major == 4 && client->attrs.minor > 3))
         {
@@ -494,6 +495,22 @@ static void init_client_context( TEB *teb, struct opengl_client_context *client,
     }
 
     TRACE( "context %p attributes %s version %s\n", client, debugstr_opengl_context_attrs( &client->attrs ), client->version_str );
+#ifdef WINE_IOS
+    /* Madeira ml1340: once per process, how a 32-bit context will serve
+     * persistent buffer maps, and whether wined3d will see query buffers. */
+    if (is_win64 && is_wow64())
+    {
+        static LONG logged;
+        if (!InterlockedExchange( &logged, 1 ))
+            ERR( "[winios-gl] ml1340 32-bit GL %d.%d context: persistent maps via %s; GL_ARB_buffer_storage %s, "
+                 "GL_ARB_query_buffer_object %s\n", client->attrs.major, client->attrs.minor,
+                 ctx->extensions[GL_MESA_map_buffer_client_pointer] ? "client pointers (GL_MESA_map_buffer_client_pointer)" :
+                 buffers.vk_device && buffers.vk_device->vk_device ? "Vulkan memory" :
+                 ctx->extensions[GL_AMD_pinned_memory] ? "GL_AMD_pinned_memory" : "nothing (extension hidden)",
+                 client->extensions[GL_ARB_buffer_storage] ? "listed" : "hidden",
+                 client->extensions[GL_ARB_query_buffer_object] ? "listed" : "not listed" );
+    }
+#endif
 
     for (i = MIN_GL_EXTENSION; i <= MAX_GL_EXTENSION; i++) if (client->extensions[i]) client->extension_array[count++] = i;
     if (client->extensions[WGL_EXT_extensions_string]) client->extension_array[count++] = WGL_EXT_extensions_string;
@@ -508,10 +525,43 @@ static void init_client_context( TEB *teb, struct opengl_client_context *client,
     client->initialized = TRUE;
 }
 
+static void free_client_pointer_ranges( TEB *teb, GLbitfield flags )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    GLsizeiptr size;
+    void *ptr;
+
+    while ((ptr = funcs->p_glReleaseClientPointerRangeMESA( flags, &size )))
+    {
+        SIZE_T alloc_size = size;
+        NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &alloc_size, MEM_RELEASE );
+    }
+}
+
 BOOL wrap_wglDeleteContext( TEB *teb, HGLRC client_context )
 {
     const struct opengl_funcs *funcs = get_context_funcs( client_context );
-    funcs->p_context_destroy( opengl_context_from_handle( client_context ) );
+    struct opengl_context *ctx = opengl_context_from_handle( client_context );
+
+    UINT64 root_context = opengl_client_context_from_client( client_context )->root_context;
+    bool use_client_pointer = is_wow64() && ctx->extensions[GL_MESA_map_buffer_client_pointer];
+
+    funcs->p_context_destroy( ctx );
+
+    /* destroy the context first to release client memory for still mapped buffers */
+    if (use_client_pointer)
+    {
+        struct set_root_context_params params = { .teb = NtCurrentTeb() };
+
+        params.root_context = root_context;
+        set_root_context( &params );
+
+        free_client_pointer_ranges( teb, GL_CLIENT_POINTER_RELEASE_ALL_MESA );
+
+        params.root_context = 0;
+        set_root_context( &params );
+    }
+
     return TRUE;
 }
 
@@ -1200,6 +1250,11 @@ NTSTATUS process_detach( void *args )
     return STATUS_SUCCESS;
 }
 
+NTSTATUS thread_detach( void *args )
+{
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS get_pixel_formats( void *args )
 {
     struct get_pixel_formats_params *params = args;
@@ -1216,7 +1271,7 @@ static pthread_mutex_t wgl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 NTSTATUS return_wow64_string( const void *str, PTR32 *wow64_str )
 {
-    struct opengl_wow64_str *ret = CONTAINING_RECORD( UlongToPtr( *wow64_str ), struct opengl_wow64_str, ptr );
+    struct opengl_wow64_str *ret = CONTAINING_RECORD( ios_wow_host_ptr( *wow64_str ), struct opengl_wow64_str, ptr );
     SIZE_T max = ret->len;
 
     if (!str)
@@ -1472,6 +1527,149 @@ static struct buffer *create_buffer_storage( TEB *teb, GLenum target, GLuint nam
     return buffer;
 }
 
+static GLint get_buffer_param( TEB *teb, GLenum target, GLenum param )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    GLint size = 0;
+    if (funcs->p_glGetBufferParameteriv) funcs->p_glGetBufferParameteriv( target, param, &size );
+    return size;
+}
+
+static GLint get_named_buffer_param( TEB *teb, GLint buffer, GLenum param )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    GLint size = 0;
+    if (funcs->p_glGetNamedBufferParameteriv) funcs->p_glGetNamedBufferParameteriv( buffer, param, &size );
+    return size;
+}
+
+static BOOL use_client_pointer( TEB *teb )
+{
+    struct opengl_context *ctx;
+    if (!(ctx = get_current_context( teb, NULL, NULL, NULL ))) return FALSE;
+    return ctx->extensions[GL_MESA_map_buffer_client_pointer];
+}
+
+static void *map_buffer_client_pointer( TEB *teb, GLenum target, GLuint name, GLintptr offset,
+                                        size_t length, GLbitfield access )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    SIZE_T alloc_size;
+    GLsizeiptr size;
+    GLenum err;
+    void *ptr;
+
+    /* save the error in the wrapper so we can check for success */
+    set_gl_error( teb, funcs->p_glGetError() );
+
+    /* first approach, either this succeeds or the driver needs more client memory */
+    if (name) ptr = funcs->p_glMapNamedBufferRange( name, offset, length, access | GL_MAP_CLIENT_POINTER_BIT_MESA );
+    else ptr = funcs->p_glMapBufferRange( target, offset, length, access | GL_MAP_CLIENT_POINTER_BIT_MESA );
+
+    /* if the driver needs more client memory GL_OUT_OF_MEMORY is returned and
+       GL_BUFFER_CLIENT_POINTER_SIZE_MESA is set to the needed size */
+    if ((err = funcs->p_glGetError()) != GL_OUT_OF_MEMORY)
+    {
+        set_gl_error( teb, err );
+        return ptr;
+    }
+
+    size = name ? get_named_buffer_param( teb, name, GL_BUFFER_CLIENT_POINTER_SIZE_MESA )
+                : get_buffer_param( teb, target, GL_BUFFER_CLIENT_POINTER_SIZE_MESA );
+    if (!size)
+    {
+        set_gl_error( teb, GL_OUT_OF_MEMORY );
+        return NULL;
+    }
+
+    alloc_size = size;
+    if (NtAllocateVirtualMemory( GetCurrentProcess(), &ptr, zero_bits, &alloc_size,
+                                 MEM_COMMIT, PAGE_READWRITE ))
+    {
+        WARN( "NtAllocateVirtualMemory failed, freeing client pointer ranges and trying again\n" );
+        free_client_pointer_ranges( teb, 0 );
+
+        if (NtAllocateVirtualMemory( GetCurrentProcess(), &ptr, zero_bits, &alloc_size,
+                                     MEM_COMMIT, PAGE_READWRITE ))
+        {
+            WARN( "NtAllocateVirtualMemory failed, freeing all client pointer ranges and trying again\n" );
+            free_client_pointer_ranges( teb, GL_CLIENT_POINTER_RELEASE_ALL_MESA );
+
+            if (NtAllocateVirtualMemory( GetCurrentProcess(), &ptr, zero_bits, &alloc_size,
+                                         MEM_COMMIT, PAGE_READWRITE ))
+            {
+                ERR( "NtAllocateVirtualMemory failed\n" );
+                set_gl_error( teb, GL_OUT_OF_MEMORY );
+                return NULL;
+            }
+        }
+    }
+
+    TRACE( "Allocated Wow64 client pointer range at %p - %p.\n", ptr, (uint8_t *)ptr + size );
+    assert( size == alloc_size );
+    funcs->p_glAddClientPointerRangeMESA( ptr, alloc_size );
+
+    /* second approach with new memory */
+    if (name) ptr = funcs->p_glMapNamedBufferRange( name, offset, length, access | GL_MAP_CLIENT_POINTER_BIT_MESA );
+    else ptr = funcs->p_glMapBufferRange( target, offset, length, access | GL_MAP_CLIENT_POINTER_BIT_MESA );
+
+    /* the mapping could have failed or gotten client memory from another thread */
+    free_client_pointer_ranges( teb, 0 );
+    return ptr;
+}
+
+/* A glGetQueryObject*v result pointer: an OFFSET into the buffer bound at
+ * GL_QUERY_BUFFER while one is bound (ARB_query_buffer_object), a guest pointer
+ * otherwise. wined3d (d3d9/d3d8 on OpenGL) reads each occlusion query through
+ * a persistently mapped buffer, asking for the result at offsets 0 and 8 and
+ * treating the query as done once both agree. Converting 8 as a guest address
+ * sent the second write out of the buffer, so the query never completed and a
+ * 32-bit program waiting on it spun in GetData until its own timeout.
+ * Madeira: MADEIRA_GL_QUERY_BUFFER_OFFSETS=0 converts every value as a guest
+ * pointer again (the behaviour before ml1340). */
+void *wow64_query_buffer_ptr( TEB *teb, ULONG value )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    GLint name = 0;
+#ifdef WINE_IOS
+    static int enabled = -1;
+    static LONG logged;
+
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_GL_QUERY_BUFFER_OFFSETS" );
+        enabled = !(env && env[0] == '0');
+    }
+    if (!enabled) return ios_wow_host_ptr( value );
+#endif
+    /* Guest memory never lies in the first 64 KB: smaller values are offsets. */
+    if (value >= 0x10000)
+    {
+        if (funcs && funcs->p_glGetIntegerv) funcs->p_glGetIntegerv( GL_QUERY_BUFFER_BINDING, &name );
+        if (!name) return ios_wow_host_ptr( value );
+    }
+#ifdef WINE_IOS
+    if (value && !InterlockedExchange( &logged, 1 ))
+        ERR( "[winios-gl] ml1340 32-bit query result goes to offset %#x of the bound query buffer "
+             "(MADEIRA_GL_QUERY_BUFFER_OFFSETS=0 disables)\n", (unsigned int)value );
+#endif
+    return ULongToPtr( value );
+}
+
+#ifdef WINE_IOS
+/* Madeira ml1340: once per process, how the first persistent (GL_MAP_PERSISTENT_BIT)
+ * map of a 32-bit caller was served. wined3d's query buffers depend on it. */
+static void log_wow64_persistent_map( GLbitfield access, const char *how, const void *ptr, size_t size )
+{
+    static LONG logged;
+    if (!(access & GL_MAP_PERSISTENT_BIT) || InterlockedExchange( &logged, 1 )) return;
+    ERR( "[winios-gl] ml1340 first 32-bit persistent buffer map: %s (guest %#x, %zu bytes, access %#x)\n",
+         how, ios_wow_guest_ptr32( ptr ), size, access );
+}
+#else
+static inline void log_wow64_persistent_map( GLbitfield access, const char *how, const void *ptr, size_t size ) { }
+#endif
+
 static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, GLuint name, GLintptr offset,
                                size_t length, GLbitfield access, void *ptr )
 {
@@ -1510,6 +1708,7 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
         }
         assert( buffer->host_ptr == buffer->vm_ptr );
         buffer->map_ptr = (char *)buffer->vm_ptr + offset;
+        log_wow64_persistent_map( access, "Vulkan memory placed in the guest window", buffer->map_ptr, buffer->size );
         TRACE( "returning vk mapping %p\n", buffer->map_ptr );
         return buffer->map_ptr;
     }
@@ -1517,11 +1716,16 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
     if (buffer && buffer->pinned)
     {
         buffer->map_ptr = (char *)buffer->vm_ptr + offset;
+        log_wow64_persistent_map( access, "pinned guest memory (GL_AMD_pinned_memory)", buffer->map_ptr, buffer->size );
         TRACE( "returning pinned ptr %p\n", buffer->map_ptr );
         return buffer->map_ptr;
     }
 
-    if (!ptr) return NULL;
+    if (!ptr)
+    {
+        log_wow64_persistent_map( access, "FAILED, the driver returned no mapping", NULL, length );
+        return NULL;
+    }
 
     if (!buffer)
     {
@@ -1541,8 +1745,9 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
 
     buffer->host_ptr = ptr;
     if (!offset && !length) length = buffer->size;
-    if (ULongToPtr(PtrToUlong(ptr)) == ptr) /* we're lucky */
+    if (ios_wow_host_ptr(PtrToUlong(ptr)) == ptr) /* we're lucky: already in the guest's 4 GB */
     {
+        log_wow64_persistent_map( access, "driver mapping inside the guest window", ptr, length );
         buffer->map_ptr = ptr;
         TRACE( "returning %p\n", buffer->map_ptr );
         return buffer->map_ptr;
@@ -1550,6 +1755,8 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
 
     if (access & GL_MAP_PERSISTENT_BIT)
     {
+        log_wow64_persistent_map( access, "FAILED, driver mapping outside the guest window and no pinned/Vulkan path",
+                                  NULL, length );
         FIXME( "GL_MAP_PERSISTENT_BIT not supported!\n" );
         goto unmap;
     }
@@ -1614,6 +1821,8 @@ void wow64_glBufferStorage( TEB *teb, GLenum target, GLsizeiptr size, const void
     const struct opengl_funcs *funcs = teb->glTable;
     struct buffer *buffer = NULL, *previous;
 
+    if (use_client_pointer( teb )) return p_glBufferStorage( target, size, data, flags | GL_MAP_CLIENT_POINTER_BIT_MESA );
+
     if (flags & GL_MAP_PERSISTENT_BIT) buffer = create_buffer_storage( teb, target, 0, size, data, flags );
     previous = set_target_buffer_storage( teb, target, buffer );
     if (!buffer) p_glBufferStorage( target, size, data, flags );
@@ -1625,6 +1834,8 @@ void wow64_glNamedBufferStorage( TEB *teb, GLuint name, GLsizeiptr size, const v
 {
     const struct opengl_funcs *funcs = teb->glTable;
     struct buffer *buffer = NULL, *previous;
+
+    if (use_client_pointer( teb )) return p_glNamedBufferStorage( name, size, data, flags | GL_MAP_CLIENT_POINTER_BIT_MESA );
 
     if (flags & GL_MAP_PERSISTENT_BIT) buffer = create_buffer_storage( teb, 0, name, size, data, flags );
     previous = set_named_buffer_storage( teb, name, buffer );
@@ -1669,6 +1880,8 @@ void *wow64_glMapBuffer( TEB *teb, GLenum target, GLenum access, PFN_glMapBuffer
     struct buffer *buffer;
     void *ptr = NULL;
 
+    if (use_client_pointer( teb )) return map_buffer_client_pointer( teb, target, 0, 0, get_buffer_param( teb, target, GL_BUFFER_SIZE ), range_access );
+
     buffer = get_target_buffer_storage( teb, target );
     if (use_driver_buffer_map( buffer )) ptr = p_glMapBuffer( target, access );
     ptr = wow64_map_buffer( teb, buffer, target, 0, 0, 0, range_access, ptr );
@@ -1680,6 +1893,8 @@ void *wow64_glMapBufferRange( TEB *teb, GLenum target, GLintptr offset, GLsizeip
 {
     struct buffer *buffer;
     void *ptr = NULL;
+
+    if (use_client_pointer( teb )) return map_buffer_client_pointer( teb, target, 0, offset, length, access );
 
     buffer = get_target_buffer_storage( teb, target );
     if (use_driver_buffer_map( buffer )) ptr = p_glMapBufferRange( target, offset, length, access );
@@ -1693,6 +1908,8 @@ void *wow64_glMapNamedBuffer( TEB *teb, GLuint name, GLenum access, PFN_glMapNam
     struct buffer *buffer;
     void *ptr = NULL;
 
+    if (use_client_pointer( teb )) return map_buffer_client_pointer( teb, 0, name, 0, get_named_buffer_param( teb, name, GL_BUFFER_SIZE ), range_access );
+
     buffer = get_named_buffer_storage( teb, name );
     if (use_driver_buffer_map( buffer )) ptr = p_glMapNamedBuffer( name, access );
     ptr = wow64_map_buffer( teb, buffer, 0, name, 0, 0, range_access, ptr );
@@ -1704,6 +1921,8 @@ void *wow64_glMapNamedBufferRange( TEB *teb, GLuint name, GLintptr offset, GLsiz
 {
     struct buffer *buffer;
     void *ptr = NULL;
+
+    if (use_client_pointer( teb )) return map_buffer_client_pointer( teb, 0, name, offset, length, access );
 
     buffer = get_named_buffer_storage( teb, name );
     if (use_driver_buffer_map( buffer )) ptr = p_glMapNamedBufferRange( name, offset, length, access );
@@ -1742,6 +1961,7 @@ GLboolean wow64_glUnmapBuffer( TEB *teb, GLenum target, PFN_glUnmapBuffer p_glUn
 
     if ((buffer = get_target_buffer_storage( teb, target ))) ret = wow64_unmap_buffer( teb, buffer );
     if (use_driver_buffer_map( buffer )) ret = p_glUnmapBuffer( target );
+    if (use_client_pointer( teb )) free_client_pointer_ranges( teb, 0 );
     return ret;
 }
 
@@ -1752,6 +1972,7 @@ GLboolean wow64_glUnmapNamedBuffer( TEB *teb, GLuint name, PFN_glUnmapBuffer p_g
 
     if ((buffer = get_named_buffer_storage( teb, name ))) ret = wow64_unmap_buffer( teb, buffer );
     if (use_driver_buffer_map( buffer )) ret = p_glUnmapNamedBuffer( name );
+    if (use_client_pointer( teb )) free_client_pointer_ranges( teb, 0 );
     return ret;
 }
 
@@ -1782,10 +2003,18 @@ void wow64_glBufferAttachMemoryNV( TEB *teb, GLenum target, GLuint memory, GLuin
     p_glBufferAttachMemoryNV( target, memory, offset );
 }
 
+static GLenum map_usage_client_pointer( GLenum usage )
+{
+    assert( usage >= GL_STREAM_DRAW && usage <= GL_DYNAMIC_COPY );
+    return usage + GL_CLIENT_POINTER_STREAM_DRAW_MESA - GL_STREAM_DRAW;
+}
+
 void wow64_glBufferData( TEB *teb, GLenum target, GLsizeiptr size, const void *data, GLenum usage, PFN_glBufferData p_glBufferData )
 {
     const struct opengl_funcs *funcs = teb->glTable;
     struct buffer *buffer;
+
+    if (use_client_pointer( teb )) return p_glBufferData( target, size, data, map_usage_client_pointer( usage ) );
 
     if ((buffer = set_target_buffer_storage( teb, target, NULL ))) free_buffer( funcs, buffer );
     p_glBufferData( target, size, data, usage );
@@ -1814,6 +2043,8 @@ void wow64_glNamedBufferData( TEB *teb, GLuint name, GLsizeiptr size, const void
     const struct opengl_funcs *funcs = teb->glTable;
     struct buffer *buffer;
 
+    if (use_client_pointer( teb )) return p_glNamedBufferData( name, size, data, map_usage_client_pointer( usage ) );
+
     if ((buffer = set_named_buffer_storage( teb, name, NULL ))) free_buffer( funcs, buffer );
     p_glNamedBufferData( name, size, data, usage );
 }
@@ -1839,6 +2070,13 @@ NTSTATUS wow64_process_detach( void *args )
     if ((status = process_detach( NULL ))) return status;
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS wow64_thread_detach( void *args )
+{
+    TEB *teb = args;
+    if (use_client_pointer( teb )) free_client_pointer_ranges( teb, GL_CLIENT_POINTER_RELEASE_ALL_MESA );
+    return thread_detach( args );
 }
 
 NTSTATUS wow64_set_root_context( void *args )
@@ -1871,7 +2109,7 @@ NTSTATUS wow64_get_pixel_formats( void *args )
     {
         .teb = get_teb64(params32->teb),
         .hdc = ULongToPtr(params32->hdc),
-        .formats = ULongToPtr(params32->formats),
+        .formats = ios_wow_host_ptr(params32->formats),
         .max_formats = params32->max_formats,
     };
     NTSTATUS status;

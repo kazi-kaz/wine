@@ -474,13 +474,13 @@ static struct context *create_thread_context( struct thread *thread )
 {
     struct context *context;
     if (!(context = alloc_object( &context_ops ))) return NULL;
-    context->sync   = NULL;
-    context->status = STATUS_PENDING;
+    context->sync        = NULL;
+    context->status      = STATUS_PENDING;
+    context->cooperative = 0;
 #ifdef WINE_IOS
     context->ios_snapshot = 0;   /* alloc_object() poisons with 0x55 */
     context->ios_dirty    = 0;
 #endif
-    context->cooperative = 0;
     memset( &context->regs, 0, sizeof(context->regs) );
     context->regs[CTX_NATIVE].machine = native_machine;
 
@@ -1750,6 +1750,8 @@ static inline int is_in_apc_wait( struct thread *thread )
  * APC_ASYNC_IO; other system APCs are unchanged. [apc-requeue] logs the first 16 handovers
  * (then every 1024th) with the APC's status and thread ids only.
  * MADEIRA_APC_REQUEUE=0 restores the drop. */
+static int ios_apc_busy_queue_enabled( void );
+
 static int ios_apc_requeue_enabled( void )
 {
     static int enabled = -1;
@@ -1762,15 +1764,63 @@ static int ios_apc_requeue_enabled( void )
         enabled = !(e && e[0] == '0');
         fprintf( stderr, "[apc-requeue] %s (MADEIRA_APC_REQUEUE=0 restores dropping async I/O APCs "
                  "for busy threads)\n", enabled ? "on" : "off" );
+        if (enabled) ios_apc_busy_queue_enabled();   /* iOS-Madeira: says once whether the busy queue is on */
     }
     return enabled;
 }
 
-/* A waiting thread, the synchronous request's future waiter, or NULL to drop. */
+/* iOS-Madeira: an async I/O APC for the only thread of a process that is running.
+ *
+ * The EA app installer's MSI package runs its managed custom actions out of process: msiexec's
+ * custom action server (SfxCA.dll from WiX) starts rundll32.exe, which asks the server over a named
+ * pipe for every MSI call (RemoteMsiSession, one request, one response, each an overlapped
+ * ReadFile/WriteFile followed by a wait on the OVERLAPPED event). rundll32 has a single thread until
+ * the CLR starts. Its first response (the data of a pending pipe read: status STATUS_ALERTED, "the
+ * client fetches the output data") arrived while that thread was still running, not yet waiting in
+ * the server, so no waiting thread existed and the APC was dropped above: the read finished with
+ * STATUS_ALERTED and no data (log: "[apc-requeue] #4 ... status=00000101 for busy thread 01c0 ->
+ * dropped, no waiting thread"), SfxCA's ReadPipe took that for a broken pipe and closed its end,
+ * the server's read ended with STATUS_PIPE_BROKEN, and every later MSI call of the custom action
+ * (DTF's RemotableNativeMethods reads a response through a NULL pointer, Mono raises
+ * NullReferenceException) failed: JunoInitializeSession returned 1603.
+ *
+ * Valve's 32-bit SteamService.exe, which Madeira Dock runs with /install to register Steam's client
+ * service on a new prefix, is the same case: one thread, and its OpenSCManager's RPC bind on
+ * \pipe\svcctl got the services.exe bind-ack while that thread was still running. The read ended
+ * with no data ("RpcAssoc_BindConnection receive failed with error 1726", "Failed to open service
+ * control manager"), the service was never registered, and every game that needs Steam's CEG step
+ * stopped with Dock code 49.
+ *
+ * So the APC stays on the busy thread when nobody else can take it. The thread runs it at its next
+ * wait in the server: check_wait returns STATUS_KERNEL_APC for any interruptible wait, and a
+ * fastsync wait parks in process for at most MADEIRA_FASTSYNC_CAP_US (2 ms) before it falls through
+ * to the server. It is not done when the process has the in-process engine (madsync:
+ * thread->alert_sync exists), where a wait can sit outside the server without a bound and a system
+ * APC does not interrupt it (the services.exe case described above). Only the drop changes, which
+ * ended the I/O with no data: a waiting thread, or a synchronous request's issuer, still takes the
+ * APC first. On by default; MADEIRA_APC_BUSY_QUEUE=0 drops the APC as before. [apc-requeue] says
+ * "kept on the busy thread" for these. */
+static int ios_apc_busy_queue_enabled( void )
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_APC_BUSY_QUEUE" );
+        enabled = !(e && e[0] == '0');
+        fprintf( stderr, "[apc-requeue] busy queue %s (MADEIRA_APC_BUSY_QUEUE=0 drops an async I/O APC "
+                 "no other thread can take; never with the in-process engine)\n", enabled ? "on" : "off" );
+    }
+    return enabled;
+}
+
+/* A waiting thread, the synchronous request's future waiter, the busy thread itself (unless
+ * MADEIRA_APC_BUSY_QUEUE=0), or NULL to drop. */
 static struct thread *ios_apc_requeue_target( struct thread *thread, const struct thread_apc *apc )
 {
     static unsigned int count;
     struct thread *candidate, *target = NULL;
+    const char *kept = NULL;
 
     if (apc->call.type != APC_ASYNC_IO || !ios_apc_requeue_enabled()) return NULL;
     LIST_FOR_EACH_ENTRY( candidate, &thread->process->thread_list, struct thread, proc_entry )
@@ -1782,12 +1832,21 @@ static struct thread *ios_apc_requeue_target( struct thread *thread, const struc
             break;
         }
     }
-    if (!target && async_can_defer_to_issuer( apc->owner, thread )) target = thread;
+    if (!target && async_can_defer_to_issuer( apc->owner, thread ))
+    {
+        target = thread;
+        kept = "issuing thread";
+    }
+    if (!target && !thread->alert_sync && ios_apc_busy_queue_enabled())   /* iOS-Madeira */
+    {
+        target = thread;
+        kept = "kept on the busy thread";
+    }
     count++;
     if (count <= 16 || !(count & 1023))
         fprintf( stderr, "[apc-requeue] #%u async I/O APC status=%08x for busy thread %04x -> %s %04x\n",
                  count, apc->call.async_io.status, thread->id,
-                 target == thread ? "issuing thread" : target ? "waiting thread" : "dropped, no waiting thread",
+                 kept ? kept : target ? "waiting thread" : "dropped, no waiting thread",
                  target ? target->id : 0 );
     return target;
 }
@@ -2023,6 +2082,7 @@ int thread_get_inflight_fd( struct thread *thread, int client )
             {
                 ret = thread->inflight[i].server;
                 thread->inflight[i].server = thread->inflight[i].client = -1;
+                clear_error();
                 return ret;
             }
         }
@@ -2078,7 +2138,7 @@ static void copy_context( struct context_data *to, const struct context_data *fr
     if (flags & SERVER_CTX_FLOATING_POINT) to->fp = from->fp;
     if (flags & SERVER_CTX_DEBUG_REGISTERS) to->debug = from->debug;
     if (flags & SERVER_CTX_EXTENDED_REGISTERS) to->ext = from->ext;
-    if (flags & SERVER_CTX_YMM_REGISTERS) to->ymm = from->ymm;
+    if (flags & SERVER_CTX_VECTOR_REGISTERS) to->vector = from->vector;
     if (flags & SERVER_CTX_EXEC_SPACE) to->exec_space = from->exec_space;
     if (flags & SERVER_CTX_TLS) to->tls = from->tls;
 }
@@ -2791,18 +2851,17 @@ DECL_HANDLER(set_thread_context)
     if (contexts[CTX_NATIVE].machine != native_machine ||
         (ctx_count == 2 && contexts[CTX_WOW].machine != thread->process->machine))
         set_error( STATUS_INVALID_PARAMETER );
-#ifdef WINE_IOS
-    /* WoW64: a SetThreadContext is only reliable on a suspended thread (the same
-     * rule Windows documents).  This host cannot stop a running thread to apply
-     * one, so refuse instead of pretending (see ios_wow_ctx_apply). */
-    else if (thread != current && ios_wow_ctx_set_on( thread ) &&
-             thread->state != TERMINATED && !is_thread_suspended( thread ))
-        set_error( STATUS_UNSUCCESSFUL );
-#endif
     else if (thread->is_system)
         set_error( STATUS_ACCESS_DENIED );
     else if (thread->state == TERMINATED)
         set_error( STATUS_UNSUCCESSFUL );
+#ifdef WINE_IOS
+    /* WoW64: a SetThreadContext is only reliable on a suspended thread (the same
+     * rule Windows documents).  This host cannot stop a running thread to apply
+     * one, so refuse instead of pretending (see ios_wow_ctx_apply). */
+    else if (thread != current && ios_wow_ctx_set_on( thread ) && !is_thread_suspended( thread ))
+        set_error( STATUS_UNSUCCESSFUL );
+#endif
     else
     {
         unsigned int flags = system_flags & contexts[CTX_NATIVE].flags;

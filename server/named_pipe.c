@@ -41,6 +41,10 @@
 #include "security.h"
 #include "process.h"
 
+/* [pipe-census] defined further down; pipe_end_destroy calls it first. */
+struct pipe_end;
+static void ios_pipe_census_del( struct pipe_end *end );
+
 struct named_pipe;
 
 struct pipe_message
@@ -158,6 +162,7 @@ static void pipe_end_flush( struct fd *fd, struct async *async );
 static void pipe_end_get_volume_info( struct fd *fd, struct async *async, unsigned int info_class );
 static void pipe_end_reselect_async( struct fd *fd, struct async_queue *queue );
 static void pipe_end_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int info_class );
+static void pipe_end_set_file_info( struct fd *fd, struct async *async, unsigned int info_class );
 
 /* server end functions */
 static void pipe_server_dump( struct object *obj, int verbose );
@@ -191,6 +196,7 @@ static const struct fd_ops pipe_server_fd_ops =
     .write           = pipe_end_write,
     .flush           = pipe_end_flush,
     .get_file_info   = pipe_end_get_file_info,
+    .set_file_info   = pipe_end_set_file_info,
     .get_volume_info = pipe_end_get_volume_info,
     .ioctl           = pipe_server_ioctl,
     .reselect_async  = pipe_end_reselect_async,
@@ -221,6 +227,7 @@ static const struct fd_ops pipe_client_fd_ops =
     .write           = pipe_end_write,
     .flush           = pipe_end_flush,
     .get_file_info   = pipe_end_get_file_info,
+    .set_file_info   = pipe_end_set_file_info,
     .get_volume_info = pipe_end_get_volume_info,
     .ioctl           = pipe_client_ioctl,
     .reselect_async  = pipe_end_reselect_async,
@@ -269,6 +276,7 @@ static const struct fd_ops named_pipe_device_fd_ops =
 {
     .get_fd_type   = named_pipe_device_file_get_fd_type,
     .get_file_info = default_fd_get_file_info,
+    .set_file_info = default_fd_set_file_info,
     .ioctl         = named_pipe_device_ioctl,
     .queue_async   = default_fd_queue_async,
 };
@@ -299,6 +307,7 @@ static const struct object_ops named_pipe_dir_ops =
 static const struct fd_ops named_pipe_dir_fd_ops =
 {
     .get_file_info = default_fd_get_file_info,
+    .set_file_info = default_fd_set_file_info,
     .ioctl         = named_pipe_dir_ioctl,
     .queue_async   = default_fd_queue_async,
 };
@@ -430,6 +439,9 @@ static void pipe_end_destroy( struct object *obj )
     struct pipe_end *pipe_end = (struct pipe_end *)obj;
     struct pipe_message *message;
 
+#ifdef WINE_IOS
+    ios_pipe_census_del( pipe_end );   /* [pipe-census] */
+#endif
     pipe_end_disconnect( pipe_end, STATUS_PIPE_BROKEN );
 
     while (!list_empty( &pipe_end->message_queue ))
@@ -844,6 +856,45 @@ static void pipe_end_get_file_info( struct fd *fd, obj_handle_t handle, unsigned
         }
     default:
         default_fd_get_file_info( fd, handle, info_class );
+    }
+}
+
+static void pipe_end_set_file_info( struct fd *fd, struct async *async, unsigned int info_class )
+{
+    struct pipe_end *pipe_end = get_fd_user( fd );
+
+    switch (info_class)
+    {
+    case FilePipeInformation:
+        {
+            const FILE_PIPE_INFORMATION *info = get_req_data();
+
+            if (get_req_data_size() < sizeof(*info))
+            {
+                set_error( STATUS_INFO_LENGTH_MISMATCH );
+            }
+            else if ((info->CompletionMode | info->ReadMode) & ~1)
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+            }
+            else if (!pipe_end->pipe)
+            {
+                set_error( STATUS_PIPE_DISCONNECTED );
+            }
+            else if (info->ReadMode && !pipe_end->pipe->message_mode)
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+            }
+            else
+            {
+                pipe_end->flags = (info->CompletionMode ? NAMED_PIPE_NONBLOCKING_MODE    : 0) |
+                                  (info->ReadMode       ? NAMED_PIPE_MESSAGE_STREAM_READ : 0);
+            }
+        }
+        break;
+
+    default:
+        default_fd_set_file_info( fd, async, info_class );
     }
 }
 
@@ -1340,6 +1391,82 @@ static void pipe_client_ioctl( struct fd *fd, ioctl_code_t code, struct async *a
     }
 }
 
+#ifdef WINE_IOS
+/* [pipe-census] (LOG ONLY): every live pipe end, so the 10 s diagnostic pass in
+ * build/wineserver/fd_ios.c can ask "is a reader queued on an end that already
+ * holds data?" -- a lost wake-up in the server. Battle.net (Chromium) talks
+ * browser <-> renderer over named pipes with overlapped reads + IOCP, and at its
+ * freeze every thread is idle. Nothing here changes pipe behaviour. */
+#define IOS_PIPE_CENSUS_MAX 4096
+static struct pipe_end *ios_pipe_ends[IOS_PIPE_CENSUS_MAX];
+static unsigned short ios_pipe_seen[IOS_PIPE_CENSUS_MAX];
+static unsigned int ios_pipe_dropped;
+
+static void ios_pipe_census_add( struct pipe_end *end )
+{
+    int i;
+    for (i = 0; i < IOS_PIPE_CENSUS_MAX; i++)
+        if (!ios_pipe_ends[i]) { ios_pipe_ends[i] = end; ios_pipe_seen[i] = 0; return; }
+    ios_pipe_dropped++;
+}
+
+static void ios_pipe_census_del( struct pipe_end *end )
+{
+    int i;
+    for (i = 0; i < IOS_PIPE_CENSUS_MAX; i++)
+        if (ios_pipe_ends[i] == end) { ios_pipe_ends[i] = NULL; return; }
+}
+
+static void ios_pipe_counts( struct pipe_end *end, unsigned int *msgs, unsigned int *bytes,
+                             unsigned int *readers, unsigned int *writers )
+{
+    struct pipe_message *m;
+    *msgs = *bytes = 0;
+    LIST_FOR_EACH_ENTRY( m, &end->message_queue, struct pipe_message, entry )
+    {
+        (*msgs)++;
+        if (m->iosb && m->iosb->in_size > m->read_pos) *bytes += m->iosb->in_size - m->read_pos;
+    }
+    *readers = list_count( &end->read_q.queue );
+    *writers = list_count( &end->write_q.queue );
+}
+
+void ios_pipe_census( void )
+{
+    int i, live = 0, waiting = 0, stuck = 0, rows = 0;
+    for (i = 0; i < IOS_PIPE_CENSUS_MAX; i++)
+    {
+        struct pipe_end *end = ios_pipe_ends[i];
+        unsigned int msgs, bytes, rd, wr, omsgs = 0, obytes = 0, ord = 0, owr = 0;
+        if (!end) continue;
+        live++;
+        ios_pipe_counts( end, &msgs, &bytes, &rd, &wr );
+        /* a queued but already-terminated async does not count: only a
+         * reader that is really still waiting (async_waiting, async.c) */
+        if (rd && !async_waiting( &end->read_q )) rd = 0;
+        if (rd) waiting++;
+        if (!(rd && msgs))
+        {
+            ios_pipe_seen[i] = 0;
+            continue;
+        }
+        if (ios_pipe_seen[i] < 0xffff) ios_pipe_seen[i]++;
+        if (ios_pipe_seen[i] < 2) continue;   /* the same end on two dumps in a row: 10 s+ */
+        stuck++;
+        if (rows >= 24) continue;
+        rows++;
+        if (end->connection) ios_pipe_counts( end->connection, &omsgs, &obytes, &ord, &owr );
+        fprintf( stderr, "[pipe-census] LOST-WAKE? end=%p %s state=%u flags=%x server_pid=%04x client_pid=%04x "
+                 "msgs=%u bytes=%u readers-waiting=%u writers=%u seen=%u | other end=%p msgs=%u readers=%u writers=%u\n",
+                 end, end->obj.ops == &pipe_server_ops ? "server" : "client", end->state, end->flags,
+                 end->server_pid, end->client_pid, msgs, bytes, rd, wr, ios_pipe_seen[i],
+                 end->connection, omsgs, ord, owr );
+    }
+    fprintf( stderr, "[pipe-census] ---- ends=%d with-reader-waiting=%d reader-waiting-on-data-10s+=%d shown=%d dropped=%u rev=pipe-census-1\n",
+             live, waiting, stuck, rows, ios_pipe_dropped );
+}
+#endif
+
 static void init_pipe_end( struct pipe_end *pipe_end, struct named_pipe *pipe,
                            unsigned int pipe_flags, data_size_t buffer_size )
 {
@@ -1351,6 +1478,9 @@ static void init_pipe_end( struct pipe_end *pipe_end, struct named_pipe *pipe,
     init_async_queue( &pipe_end->read_q );
     init_async_queue( &pipe_end->write_q );
     list_init( &pipe_end->message_queue );
+#ifdef WINE_IOS
+    ios_pipe_census_add( pipe_end );   /* [pipe-census] */
+#endif
 }
 
 static struct pipe_server *create_pipe_server( struct named_pipe *pipe, unsigned int options,
@@ -1601,38 +1731,4 @@ DECL_HANDLER(create_named_pipe)
     }
 
     release_object( pipe );
-}
-
-DECL_HANDLER(set_named_pipe_info)
-{
-    struct pipe_end *pipe_end;
-
-    pipe_end = (struct pipe_end *)get_handle_obj( current->process, req->handle,
-                                                  FILE_WRITE_ATTRIBUTES, &pipe_server_ops );
-    if (!pipe_end)
-    {
-        if (get_error() != STATUS_OBJECT_TYPE_MISMATCH)
-            return;
-
-        clear_error();
-        pipe_end = (struct pipe_end *)get_handle_obj( current->process, req->handle,
-                                                      0, &pipe_client_ops );
-        if (!pipe_end) return;
-    }
-
-    if (!pipe_end->pipe)
-    {
-        set_error( STATUS_PIPE_DISCONNECTED );
-    }
-    else if ((req->flags & ~(NAMED_PIPE_MESSAGE_STREAM_READ | NAMED_PIPE_NONBLOCKING_MODE)) ||
-            ((req->flags & NAMED_PIPE_MESSAGE_STREAM_READ) && !pipe_end->pipe->message_mode))
-    {
-        set_error( STATUS_INVALID_PARAMETER );
-    }
-    else
-    {
-        pipe_end->flags = req->flags;
-    }
-
-    release_object( pipe_end );
 }

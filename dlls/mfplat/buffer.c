@@ -195,6 +195,12 @@ static ULONG WINAPI memory_buffer_Release(IMFMediaBuffer *iface)
         }
         if (buffer->d3d12_surface.resource)
         {
+            if (buffer->d3d12_surface.queue && buffer->d3d12_surface.fence)
+            {
+                ID3D12CommandQueue_Signal(buffer->d3d12_surface.queue, buffer->d3d12_surface.fence,
+                        ++buffer->d3d12_surface.fence_value);
+                ID3D12Fence_SetEventOnCompletion(buffer->d3d12_surface.fence, buffer->d3d12_surface.fence_value, NULL);
+            }
             ID3D12Device_Release(buffer->d3d12_surface.device);
             ID3D12Resource_Release(buffer->d3d12_surface.resource);
             if (buffer->d3d12_surface.sync_obj) IMFD3D12SynchronizationObject_Release(buffer->d3d12_surface.sync_obj);
@@ -318,6 +324,13 @@ static HRESULT WINAPI memory_1d_2d_buffer_QueryInterface(IMFMediaBuffer *iface, 
     }
     else
     {
+        /* iOS-Madeira mf-sysmem-fallback (sample.c): a caller that wants the
+         * texture behind a buffer that had to be made in system memory */
+        extern LONG madeira_mf_sysmem_fallbacks;
+        static LONG asked;
+        if (IsEqualIID(riid, &IID_IMFDXGIBuffer) && madeira_mf_sysmem_fallbacks
+                && InterlockedIncrement(&asked) <= 4)
+            ERR("[mf-sysmem] IMFDXGIBuffer asked of system-memory buffer %p: the caller wants a GPU texture\n", buffer);
         WARN("Unsupported interface %s.\n", debugstr_guid(riid));
         *out = NULL;
         return E_NOINTERFACE;
@@ -442,6 +455,11 @@ static HRESULT WINAPI d3d9_surface_buffer_Lock(IMFMediaBuffer *iface, BYTE **dat
                 copy_image(buffer, buffer->_2d.linear_buffer, buffer->_2d.width, rect.pBits, rect.Pitch,
                         buffer->_2d.width, buffer->_2d.height);
                 IDirect3DSurface9_UnlockRect(buffer->d3d9_surface.surface);
+            }
+            else
+            {
+                free(buffer->_2d.linear_buffer);
+                buffer->_2d.linear_buffer = NULL;
             }
         }
     }
@@ -1075,6 +1093,11 @@ static HRESULT WINAPI dxgi_surface_buffer_Lock(IMFMediaBuffer *iface, BYTE **dat
                 copy_image(buffer, buffer->_2d.linear_buffer, buffer->_2d.width, buffer->dxgi_surface.map_desc.pData,
                         buffer->dxgi_surface.map_desc.RowPitch, buffer->_2d.width, buffer->_2d.height);
             }
+            else
+            {
+                free(buffer->_2d.linear_buffer);
+                buffer->_2d.linear_buffer = NULL;
+            }
         }
     }
 
@@ -1509,8 +1532,13 @@ static HRESULT d3d12_surface_buffer_map(struct buffer *buffer, MF2DBuffer_LockFl
             hr = d3d12_surface_buffer_create_transfer_resource(buffer, transfer, flags);
         buffer->d3d12_surface.transfer = *transfer;
 
-        if (SUCCEEDED(hr) && flags != MF2DBuffer_LockFlags_Write)
-            hr = d3d12_surface_buffer_copy_transfer_resource(buffer, flags);
+        if (SUCCEEDED(hr))
+        {
+            if (flags != MF2DBuffer_LockFlags_Write)
+                hr = d3d12_surface_buffer_copy_transfer_resource(buffer, flags);
+            else if (buffer->d3d12_surface.fence)
+                hr = ID3D12Fence_SetEventOnCompletion(buffer->d3d12_surface.fence, buffer->d3d12_surface.fence_value, NULL);
+        }
     }
 
     if (SUCCEEDED(hr))

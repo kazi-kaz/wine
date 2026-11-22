@@ -3010,6 +3010,43 @@ failed:
     return hr;
 }
 
+/* iOS-Madeira mf-reader-log (LOG ONLY): Resident Evil Village (0.2.52) crashed
+ * calling a source reader that was never made, and nothing in the log said why.
+ * Log each failed step of making a source reader, with the stream's name and
+ * content type when it has them. First 32 lines per process.
+ * env MADEIRA_MF_READER_LOG=0 turns it off. */
+static BOOL mf_reader_log_on(void)
+{
+    static int on = -1;
+    static LONG n;
+    if (on < 0)
+    {
+        char v[8];
+        DWORD len = GetEnvironmentVariableA("MADEIRA_MF_READER_LOG", v, sizeof(v));
+        on = !(len == 1 && v[0] == '0');
+    }
+    return on && InterlockedIncrement(&n) <= 32;
+}
+
+static void mf_reader_log_stream(const char *step, IMFByteStream *stream, HRESULT hr)
+{
+    WCHAR *name = NULL, *type = NULL;
+    IMFAttributes *attr;
+    UINT32 len;
+
+    if (!mf_reader_log_on()) return;
+    if (stream && SUCCEEDED(IMFByteStream_QueryInterface(stream, &IID_IMFAttributes, (void **)&attr)))
+    {
+        IMFAttributes_GetAllocatedString(attr, &MF_BYTESTREAM_ORIGIN_NAME, &name, &len);
+        IMFAttributes_GetAllocatedString(attr, &MF_BYTESTREAM_CONTENT_TYPE, &type, &len);
+        IMFAttributes_Release(attr);
+    }
+    ERR("[mf-reader] %s failed hr %#lx: stream %p name %s content-type %s\n", step, hr, stream,
+            debugstr_w(name), debugstr_w(type));
+    CoTaskMemFree(name);
+    CoTaskMemFree(type);
+}
+
 static HRESULT create_source_reader_from_stream(IMFByteStream *stream, IMFAttributes *attributes,
         REFIID riid, void **out)
 {
@@ -3032,9 +3069,13 @@ static HRESULT create_source_reader_from_stream(IMFByteStream *stream, IMFAttrib
     if (props)
         IPropertyStore_Release(props);
     if (FAILED(hr))
+    {
+        mf_reader_log_stream("byte stream -> media source (source resolver)", stream, hr);
         return hr;
+    }
 
     hr = create_source_reader_from_source(source, attributes, TRUE, riid, out);
+    if (FAILED(hr)) mf_reader_log_stream("media source -> source reader (from a byte stream)", stream, hr);
     IMFMediaSource_Release(source);
     return hr;
 }
@@ -3080,9 +3121,15 @@ static HRESULT create_source_reader_from_url(const WCHAR *url, IMFAttributes *at
     if (props)
         IPropertyStore_Release(props);
     if (FAILED(hr))
+    {
+        if (mf_reader_log_on())
+            ERR("[mf-reader] url -> media source (source resolver) failed hr %#lx: url %s\n", hr, debugstr_w(url));
         return hr;
+    }
 
     hr = create_source_reader_from_source(source, attributes, TRUE, riid, out);
+    if (FAILED(hr) && mf_reader_log_on())
+        ERR("[mf-reader] media source -> source reader failed hr %#lx: url %s\n", hr, debugstr_w(url));
     IMFMediaSource_Release(source);
     return hr;
 }
@@ -3104,9 +3151,13 @@ static HRESULT create_source_reader_from_object(IUnknown *unk, IMFAttributes *at
         if (attributes)
             IMFAttributes_GetUINT32(attributes, &MF_SOURCE_READER_DISCONNECT_MEDIASOURCE_ON_SHUTDOWN, &disconnect);
         hr = create_source_reader_from_source(source, attributes, !disconnect, riid, out);
+        if (FAILED(hr) && mf_reader_log_on())
+            ERR("[mf-reader] media source %p -> source reader failed hr %#lx\n", source, hr);
     }
     else if (stream)
         hr = create_source_reader_from_stream(stream, attributes, riid, out);
+    else if (mf_reader_log_on())
+        ERR("[mf-reader] object %p is neither a media source nor a byte stream (hr %#lx)\n", unk, hr);
 
     if (source)
         IMFMediaSource_Release(source);

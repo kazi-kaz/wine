@@ -32,6 +32,14 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 
+#ifdef WINE_IOS
+/* iOS-Madeira: a 32-bit program's ATOM can arrive here with its guest window base added; build/win32u-unix/class_ios.c
+ * gives it back (the wow64win.dll that does the adding is a prebuilt binary). Anything else is returned as it came. */
+extern const WCHAR *ios_atom_arg( const WCHAR *ptr );
+#else
+static inline const WCHAR *ios_atom_arg( const WCHAR *ptr ) { return ptr; }
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
 #define USER_HANDLE_TO_INDEX(hwnd) ((LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1)
@@ -487,6 +495,13 @@ BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size
     return updated;
 }
 
+SIZE get_client_swapchain_size( HWND toplevel, HWND hwnd )
+{
+    RECT monitor, rect = get_client_surface_rects( toplevel, hwnd, &monitor );
+    SIZE size = { max( 1, rect.right - rect.left ), max( 1, rect.bottom - rect.top ) };
+    return size;
+}
+
 void use_window_client_surface( struct client_surface *surface, BOOL use )
 {
     TRACE( "surface %s, use %u\n", debugstr_client_surface( surface ), use );
@@ -533,14 +548,13 @@ struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL ra
     return surface ? surface : user_driver->pCreateClientSurface( hwnd, format, raw );
 }
 
-BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd )
+HWND get_client_surface_window( struct client_surface *surface )
 {
-    BOOL ret;
+    HWND ret;
 
     if (!surface) return FALSE;
     pthread_mutex_lock( &surfaces_lock );
-    if (hwnd) ret = surface->hwnd == hwnd;
-    else ret = surface->hwnd != NULL;
+    ret = surface->hwnd;
     pthread_mutex_unlock( &surfaces_lock );
 
     return ret;
@@ -1781,6 +1795,8 @@ HANDLE WINAPI NtUserGetProp( HWND hwnd, const WCHAR *str )
 {
     ULONG_PTR ret = 0;
 
+    str = ios_atom_arg( str );
+
     SERVER_START_REQ( get_window_property )
     {
         req->window = wine_server_user_handle( hwnd );
@@ -1801,6 +1817,8 @@ HANDLE WINAPI NtUserGetProp( HWND hwnd, const WCHAR *str )
 BOOL WINAPI NtUserSetProp( HWND hwnd, const WCHAR *str, HANDLE handle )
 {
     BOOL ret;
+
+    str = ios_atom_arg( str );
 
     SERVER_START_REQ( set_window_property )
     {
@@ -1824,6 +1842,8 @@ BOOL WINAPI NtUserSetProp( HWND hwnd, const WCHAR *str, HANDLE handle )
 HANDLE WINAPI NtUserRemoveProp( HWND hwnd, const WCHAR *str )
 {
     ULONG_PTR ret = 0;
+
+    str = ios_atom_arg( str );
 
     SERVER_START_REQ( remove_window_property )
     {
@@ -5478,6 +5498,7 @@ LRESULT destroy_window( HWND hwnd )
     HMENU menu = 0, sys_menu;
     WND *win;
     HWND *children, toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+    struct list swapchains = LIST_INIT(swapchains);
 
     TRACE( "%p\n", hwnd );
 
@@ -5526,6 +5547,7 @@ LRESULT destroy_window( HWND hwnd )
     NtUserDestroyCursor( win->hIconSmall2, 0 );
     surface = win->surface;
     win->surface = NULL;
+    list_move_tail( &swapchains, &win->opengl_swapchains );
     release_win_ptr( win );
 
     release_opengl_drawables( &drawables );
@@ -5538,6 +5560,7 @@ LRESULT destroy_window( HWND hwnd )
         window_surface_release( surface );
     }
 
+    free_opengl_swapchains( &swapchains );
     detach_client_surfaces( hwnd );
     if (win->current_drawable) opengl_drawable_release( win->current_drawable );
     if (win->unused_drawable) opengl_drawable_release( win->unused_drawable );
@@ -5651,7 +5674,7 @@ void destroy_thread_windows(void)
         struct destroy_entry *next;
     } *entry, *free_list = NULL;
     HWND capture = get_capture(), toplevel = NtUserGetAncestor( capture, GA_ROOT );
-    struct list drawables = LIST_INIT(drawables);
+    struct list drawables = LIST_INIT(drawables), swapchains = LIST_INIT(swapchains);
     HANDLE handle = 0;
     WND *win;
 
@@ -5664,6 +5687,7 @@ void destroy_thread_windows(void)
         BOOL is_child = (win->dwStyle & (WS_CHILD | WS_POPUP)) == WS_CHILD;
         struct destroy_entry tmp = {0};
 
+        list_move_tail( &swapchains, &win->opengl_swapchains );
         free_dce( win->dce, win->handle, &drawables );
         set_user_handle_ptr( handle, NULL );
         free( win->pScroll );
@@ -5694,6 +5718,7 @@ void destroy_thread_windows(void)
     user_unlock();
 
     release_opengl_drawables( &drawables );
+    free_opengl_swapchains( &swapchains );
 
     while ((entry = free_list))
     {
@@ -5810,6 +5835,7 @@ static WND *create_window_handle( HWND parent, HWND owner, UNICODE_STRING *name,
     win->parent     = full_parent;
     win->owner      = full_owner;
     win->class      = class;
+    list_init( &win->opengl_swapchains );
     set_user_handle_ptr( handle, win );
     return win;
 }
@@ -5915,6 +5941,8 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
     RECT surface_rect;
     UINT context;
     WND *win;
+
+    class = ios_atom_arg( class );   /* iOS-Madeira: a class ATOM stays an atom (the TRACE below and IS_INTRESOURCE(class) read it) */
 
     TRACE( "ex_style %#x, class_name %s, version %s, window_name %s, style %#x, x %u, y %u, cx %u, cy %u, "
            "parent %p, menu %p, class_instance %p, params %p, flags %#x, instance %p, class %s, ansi %u\n",

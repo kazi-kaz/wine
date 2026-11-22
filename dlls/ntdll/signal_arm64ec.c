@@ -39,6 +39,15 @@
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
 
+struct xcontext
+{
+    ARM64EC_NT_CONTEXT c;
+    CONTEXT_EX c_ex;
+    char xs[sizeof(XSTATE) + 64];
+};
+
+C_ASSERT( sizeof(struct xcontext) == 0x670 );
+
 /* xtajit64.dll functions */
 static void     (WINAPI *pBTCpu64FlushInstructionCache)(const void*,SIZE_T);
 static BOOLEAN  (WINAPI *pBTCpu64IsProcessorFeaturePresent)(UINT);
@@ -69,7 +78,9 @@ static NTSTATUS (WINAPI *pThreadInit)(void);
 static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
 static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
 
-static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+/* store full xstate before the config is fully initialized */
+static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX] = { [PF_AVX_INSTRUCTIONS_AVAILABLE] = TRUE };
+
 static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
 extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
 
@@ -142,7 +153,10 @@ static inline struct ec_thread_state *ec_state( void )
     CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
     ULONG_PTR p;
     if (!area) return &ec_state_fallback;
-    p = (ULONG_PTR)area + FIELD_OFFSET( CHPE_V2_CPU_AREA_INFO, EmulatorDataInline ) + sizeof(ARM64EC_NT_CONTEXT);
+    /* Wine 11.22: dispatch_emulation() writes a whole struct xcontext (context,
+     * CONTEXT_EX and XSTATE, 0x670 bytes) at ContextAmd64, so the free bytes
+     * start after that, not after the bare context. */
+    p = (ULONG_PTR)area + FIELD_OFFSET( CHPE_V2_CPU_AREA_INFO, EmulatorDataInline ) + sizeof(struct xcontext);
     p = (p + 15) & ~(ULONG_PTR)15;
     return (struct ec_thread_state *)p;
 }
@@ -362,7 +376,7 @@ static inline void leave_syscall_callback(void)
     CHPE_V2_CPU_AREA_INFO *cpu_area = get_arm64ec_cpu_area();
     CONTEXT ctx;
 
-    if (!cpu_area) return;
+    if (!cpu_area) return;   /* iOS-Madeira: a thread with no CPU area yet */
     cpu_area->InSyscallCallback = 0;
 
     if (!cpu_area->InSimulation && cpu_area->SuspendDoorbell && *cpu_area->SuspendDoorbell)
@@ -543,6 +557,12 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
             void *target = (char *)ptr + 14 + off;
             return xlate_ios_jit( target );
         }
+        /* Madeira [hotpatch-thunks]: step over the 8-byte hotpatch prologue
+         * (48 8d a4 24 00 00 00 00) the loader puts before forwarder jumps when
+         * env MADEIRA_ARM64X_HOTPATCH_THUNKS = 1. */
+        if (bytes[0] == 0x48 && bytes[1] == 0x8d && bytes[2] == 0xa4 && bytes[3] == 0x24 &&
+            !bytes[4] && !bytes[5] && !bytes[6] && !bytes[7] && bytes[8] == 0xff && bytes[9] == 0x25)
+            bytes += 8;
         /* (a) simple forwarder thunk */
         if (bytes[0] == 0xff && bytes[1] == 0x25)
         {
@@ -610,6 +630,63 @@ static void arm64x_check_call(void);
  * to phase 2 (arm64ec_process_init_finish), which runs AFTER DllMains
  * because FEX's CRT init requires ucrtbase to be initialized.
  */
+/* rtcs-diag (Battle.net / Overwatch 2 test builds): diagnostic only, no behaviour change.
+ * In the Overwatch process pResetToConsistentState was NULL ("[rtcs] pre ... rtcs=0000000000000000"), so a
+ * brk #0 from FEX's guest-SIGTRAP stub reached the guest handler with the host rip and sp. This logs what
+ * the CPU module's ResetToConsistentState export looked like at init and whether the pointer is still the
+ * same at the first exceptions. MADEIRA_RTCS_DIAG=0 turns it off (read once; any other value leaves it on). */
+static void *rtcs_diag_raw, *rtcs_diag_init;
+static LONG rtcs_diag_hits;
+
+static BOOL rtcs_diag_enabled( void )
+{
+    static LONG mode;   /* 0 not yet, 1 off, 2 on */
+
+    if (!mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_RTCS_DIAG" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    return mode == 2;
+}
+
+/* rtcs-diag2 (bnettest22): the bnettest21 log showed pointer, stored-at-init and export all reading 0 at
+ * the exception although init had set them (same thread). So either this .data page was cleared after init,
+ * or the exception runs in a DIFFERENT ntdll instance than the one init wrote. Log, at init and at the
+ * exception: where the static lives, which code instance is running (this function's address), the
+ * arm64x_check_call address init stashed in PEB.WerRegistrationData versus this instance's own, and an
+ * FNV-1a hash of the 4 KB page holding the static. Same off switch: MADEIRA_RTCS_DIAG=0. */
+/* returns the FNV-1a hash; *nz = non-zero bytes in the page (a page cleared after init shows only the few
+ * bytes the diag's own counters wrote since, instead of hundreds) */
+static unsigned int rtcs_diag_page_fnv( const void *p, unsigned int *nz )
+{
+    const unsigned char *b = (const unsigned char *)((ULONG_PTR)p & ~(ULONG_PTR)0xfff);
+    unsigned int h = 2166136261u, i;
+
+    *nz = 0;
+    for (i = 0; i < 0x1000; i++) { h = (h ^ b[i]) * 16777619u; *nz += b[i] != 0; }
+    return h;
+}
+
+static void rtcs_diag_where( const char *when )
+{
+    void *stashed = RtlGetCurrentPeb()->WerRegistrationData;
+    void *mine = (void *)arm64x_check_call;
+    unsigned int nz, fnv = rtcs_diag_page_fnv( &pResetToConsistentState, &nz );
+
+    ERR( "[rtcs-where] %s: static=%p value=%p code=%p check_call peb=%p this-copy=%p (%s) page-fnv=%08x page-nonzero-bytes=%u rev=rtcs-diag2\n",
+         when, (void *)&pResetToConsistentState, (void *)pResetToConsistentState, (void *)rtcs_diag_where,
+         stashed, mine, stashed == mine ? "same ntdll instance as init" : "DIFFERENT ntdll instance from init",
+         fnv, nz );
+}
+
 NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
 {
     CHPEV2_PROCESS_INFO *info = (CHPEV2_PROCESS_INFO *)(RtlGetCurrentPeb() + 1);
@@ -803,6 +880,20 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     GET_PTR( UpdateProcessorInformation );
 #undef GET_PTR
 
+    if (rtcs_diag_enabled())
+    {
+        const unsigned char *b = rtcs_diag_raw = RtlFindExportedRoutineByName( module, "ResetToConsistentState" );
+
+        rtcs_diag_init = (void *)pResetToConsistentState;
+        ERR( "[rtcs-ptr] init: module=%p redirect-entries=%u ResetToConsistentState export=%p pointer=%p "
+             "bytes=%02x%02x%02x%02x%02x%02x%02x%02x | ProcessInit=%p ThreadInit=%p BeginSimulation=%p "
+             "NotifyMemoryAlloc=%p rev=rtcs-diag\n",
+             module, (unsigned int)metadata->RedirectionMetadataCount, rtcs_diag_raw, (void *)pResetToConsistentState,
+             b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, b ? b[4] : 0, b ? b[5] : 0, b ? b[6] : 0, b ? b[7] : 0,
+             (void *)pProcessInit, (void *)pThreadInit, (void *)pBeginSimulation, (void *)pNotifyMemoryAlloc );
+        rtcs_diag_where( "init" );
+    }
+
     RtlGetCurrentPeb()->ChpeV2ProcessInfo = info;
     info->NativeMachineType = IMAGE_FILE_MACHINE_ARM64;
     info->EmulatedMachineType = IMAGE_FILE_MACHINE_AMD64;
@@ -917,6 +1008,7 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     {
         for (unsigned int i = 0; i < PROCESSOR_FEATURE_MAX; i++)
             emulated_processor_features[i] = pBTCpu64IsProcessorFeaturePresent( i );
+
         status = create_cross_process_work_list( info );
         ERR( "arm64ec_process_init: create_cross_process_work_list -> %lx\n", status );
     }
@@ -1380,16 +1472,18 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
 NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    if ((status = context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context ))) return status;
     return syscall_NtContinue( &arm_ctx, alertable );
 }
 
 NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    if ((status = context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context ))) return status;
     return syscall_NtContinueEx( &arm_ctx, args );
 }
 
@@ -1822,9 +1916,25 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
 NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
 {
     ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( context->ContextFlags ) };
-    NTSTATUS status = syscall_NtGetContextThread( handle, &arm_ctx );
+    NTSTATUS status;
 
-    if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
+    if ((context->ContextFlags & CONTEXT_AMD64_XSTATE) == CONTEXT_AMD64_XSTATE)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+        XSTATE *xstate = (XSTATE *)((char *)context_ex + context_ex->XState.Offset);
+
+        if (context_ex->XState.Length < sizeof(XSAVE_AREA_HEADER) || context_ex->XState.Length > sizeof(*xstate))
+            return STATUS_INVALID_PARAMETER;
+
+        xstate->Mask &= XSTATE_MASK_AVX & RtlGetEnabledExtendedFeatures( XSTATE_MASK_AVX );
+        xstate->CompactionMask = 0;
+        if ((xstate->Mask & XSTATE_MASK_AVX) && context_ex->XState.Length < sizeof(*xstate))
+            return STATUS_BUFFER_OVERFLOW;
+    }
+
+    status = syscall_NtGetContextThread( handle, &arm_ctx );
+    if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx,
+                                     ctx_flags_arm_to_x64( arm_ctx.ContextFlags ) | (context->ContextFlags & CONTEXT_AMD64_XSTATE));
 
     /* ml715: WHAT THE CALLER ACTUALLY RECEIVES.
      *
@@ -1906,6 +2016,26 @@ static void ios_log_unmap( void *addr )
     }
 }
 
+/* MADEIRA_MAP_EXEC_VIEW, read once: 0 not yet, 1 off (value "0"), 2 on (default). */
+static BOOL ios_map_exec_view_enabled( void )
+{
+    static LONG mode;
+
+    if (!mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_MAP_EXEC_VIEW" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    return mode == 2;
+}
+
 static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
                                         ULONG protect, NTSTATUS *ret_status )
 {
@@ -1933,6 +2063,24 @@ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, 
     if (!NtCurrentTeb()->Tib.ArbitraryUserPointer)
     {
         static int skip_aup;
+        /* map-exec-view: a view mapped with no ArbitraryUserPointer is not a loader image map,
+         * so it is not handed to NotifyMapViewOfSection. If its protection asks for execute,
+         * though (StarCraft's ClientSdk.dll: the image section mapped as plain data, protected
+         * RWX, unmapped, then mapped again in pieces with the .text as PAGE_EXECUTE_READ), FEX
+         * never learns the range is code: the unmap removed it from XIntervals and nothing adds
+         * it back, so the first decode there is NOEXEC and the process dies with c0000005.
+         * Tell FEX the way an [exec-req] NtProtectVirtualMemory does: the post-protect
+         * notification for the same address, size and protection. Views with an
+         * ArbitraryUserPointer and views without execute are left alone. */
+        if ((protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && pNotifyMemoryProtect && ios_map_exec_view_enabled())
+        {
+            static LONG exec_view_n;
+            LONG n = InterlockedIncrement( &exec_view_n );
+            if (n <= 16)
+                ERR( "[map-exec-view] #%d base=%p size=%p prot=%x\n", (int)n, addr, (void *)size, protect );
+            pNotifyMemoryProtect( addr, size, protect, TRUE, STATUS_SUCCESS );
+        }
         if (skip_aup < 20)
         { skip_aup++; ERR( "[map-notify] SKIP (no ArbitraryUserPointer) addr=%p size=%p\n", addr, (void *)size ); }
         return;
@@ -2284,8 +2432,9 @@ NTSTATUS SYSCALL_API NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class, v
 NTSTATUS SYSCALL_API NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    if ((status = context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context ))) return status;
     return syscall_NtRaiseException( rec, &arm_ctx, first_chance );
 }
 
@@ -2312,8 +2461,9 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
 NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    if ((status = context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context ))) return status;
     return syscall_NtSetContextThread( handle, &arm_ctx );
 }
 
@@ -2892,6 +3042,155 @@ static void ios_fatal_probe( const CONTEXT *ctx )
          (unsigned)(got / sizeof(ULONG_PTR)), hits, printed - hits );
 }
 
+/* madeira-bcd [wild-exec] (env MADEIRA_WILD_EXEC_PROBE = 0 turns it off). Log only.
+ *
+ * Overwatch 2 on 0.2.60 (log 7747ade4) died on "AV EXEC of 1533C7640": x64 code went to an
+ * address that is in no loaded module of the process (it sits in JIT-pool space that earlier
+ * held another pseudo-process's DLL copies). The log has no guest registers or stack for it, so
+ * the producer (a ret, a call through a stale pointer, a table) can't be named. When an execute
+ * fault's target is outside every module, print the full guest register set and the first 24
+ * raw stack qwords (with module+offset when one matches), then the ml843 call-chain scan. Up to
+ * 4 reports per process; nothing is changed. */
+/* wild-exec v2: hex dump of guest memory, 32 bytes per line, never faults (NtReadVirtualMemory).
+ * Each line is read on its own so a locked page after a readable one doesn't hide the readable part. */
+static void ios_wild_exec_hex( const char *what, ULONG_PTR addr, SIZE_T len )
+{
+    static const char hx[] = "0123456789abcdef";
+    unsigned char buf[32];
+    SIZE_T got, off, j;
+    char line[3 * 32 + 1];
+
+    if (len > 0x200) len = 0x200;
+    for (off = 0; off < len; off += 32)
+    {
+        SIZE_T want = len - off < 32 ? len - off : 32;
+        got = 0;
+        if (addr + off < 0x10000 ||
+            NtReadVirtualMemory( GetCurrentProcess(), (void *)(addr + off), buf, want, &got ) || !got)
+        {
+            ERR( "[wild-exec]   %s @%p: unreadable\n", what, (void *)(addr + off) );
+            continue;
+        }
+        for (j = 0; j < got; j++)
+        {
+            line[j * 3] = hx[buf[j] >> 4];
+            line[j * 3 + 1] = hx[buf[j] & 15];
+            line[j * 3 + 2] = ' ';
+        }
+        line[j * 3] = 0;
+        ERR( "[wild-exec]   %s @%p: %s\n", what, (void *)(addr + off), line );
+    }
+}
+
+static void ios_wild_exec_probe( const EXCEPTION_RECORD *rec, const CONTEXT *ctx )
+{
+    static LONG mode, reports;
+    ULONG_PTR target, base = 0, stk[24], from;
+    SIZE_T got = 0, i;
+    char name[40];
+    LONG n;
+
+    if (rec->ExceptionCode != STATUS_ACCESS_VIOLATION || rec->NumberParameters < 2 ||
+        rec->ExceptionInformation[0] != EXCEPTION_EXECUTE_FAULT || !ctx) return;
+    target = rec->ExceptionInformation[1];
+    if (reports >= 4) return;   /* skip the unlocked module walk once the cap is used up */
+    if (ios_probe_module( target, &base, name, sizeof(name) )) return;   /* inside a module: normal */
+    if (!mode)
+    {
+        UNICODE_STRING var, value;
+        WCHAR buffer[2];
+        RtlInitUnicodeString( &var, L"MADEIRA_WILD_EXEC_PROBE" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    if (mode != 2 || (n = InterlockedIncrement( &reports )) > 4) return;
+
+    ERR( "[wild-exec] #%ld tid=%04x target=%p (in no module) Rip=%p Rsp=%p Rbp=%p EFlags=%08x rev=wild-exec-2\n",
+         n, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, (void *)target,
+         (void *)ctx->Rip, (void *)ctx->Rsp, (void *)ctx->Rbp, (unsigned)ctx->EFlags );
+    ERR( "[wild-exec]   Rax=%p Rbx=%p Rcx=%p Rdx=%p Rsi=%p Rdi=%p\n", (void *)ctx->Rax, (void *)ctx->Rbx,
+         (void *)ctx->Rcx, (void *)ctx->Rdx, (void *)ctx->Rsi, (void *)ctx->Rdi );
+    ERR( "[wild-exec]   R8=%p R9=%p R10=%p R11=%p R12=%p R13=%p R14=%p R15=%p\n", (void *)ctx->R8,
+         (void *)ctx->R9, (void *)ctx->R10, (void *)ctx->R11, (void *)ctx->R12, (void *)ctx->R13,
+         (void *)ctx->R14, (void *)ctx->R15 );
+    /* from Rsp-0x10: after a ret the popped target sits at rsp-8 (if the dispatch frame left it) */
+    from = (ULONG_PTR)ctx->Rsp - 0x10;
+    if (NtReadVirtualMemory( GetCurrentProcess(), (void *)from, stk, sizeof(stk), &got ) || got < 8)
+        ERR( "[wild-exec]   stack at %p unreadable\n", (void *)from );
+    else
+        for (i = 0; i < got / sizeof(ULONG_PTR); i++)
+        {
+            if (ios_probe_module( stk[i], &base, name, sizeof(name) ))
+                ERR( "[wild-exec]   rsp%+04d = %p  %s+0x%llx\n", (int)(i * 8) - 0x10, (void *)stk[i], name,
+                     (unsigned long long)(stk[i] - base) );
+            else
+                ERR( "[wild-exec]   rsp%+04d = %p\n", (int)(i * 8) - 0x10, (void *)stk[i] );
+        }
+
+    /* v2: the data the registers point at (jump tables / decoded pointers), and the code of the
+     * function that made the jump: the first CALL-validated return address on the stack names its
+     * caller, and an E8 rel32 there names the callee's entry. Code pages the game keeps
+     * NOACCESS print "unreadable". */
+    ios_wild_exec_hex( "[rax-0x20]", (ULONG_PTR)ctx->Rax - 0x20, 0x60 );
+    ios_wild_exec_hex( "[rbx]", (ULONG_PTR)ctx->Rbx, 0x40 );
+    ios_wild_exec_hex( "[rdx]", (ULONG_PTR)ctx->Rdx, 0x40 );
+    ios_wild_exec_hex( "[r12]", (ULONG_PTR)ctx->R12, 0x40 );
+    {
+        /* optional extra address from the game's config: env.MADEIRA_WILD_EXEC_DUMP = <hex> (0x80 bytes) */
+        UNICODE_STRING var, value;
+        WCHAR buffer[24];
+        ULONG_PTR extra = 0;
+        unsigned k;
+        RtlInitUnicodeString( &var, L"MADEIRA_WILD_EXEC_DUMP" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        if (!RtlQueryEnvironmentVariable_U( NULL, &var, &value ))
+            for (k = 0; k < value.Length / sizeof(WCHAR); k++)
+            {
+                WCHAR c = buffer[k];
+                if (k == 1 && (c == 'x' || c == 'X') && buffer[0] == '0') { extra = 0; continue; }
+                if (c >= '0' && c <= '9') extra = extra * 16 + (c - '0');
+                else if (c >= 'a' && c <= 'f') extra = extra * 16 + (c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F') extra = extra * 16 + (c - 'A' + 10);
+                else { extra = 0; break; }
+                if (k >= 17) { extra = 0; break; }   /* more than 16 hex digits */
+            }
+        if (extra) ios_wild_exec_hex( "[extra]", extra, 0x80 );
+        else if (value.Length) ERR( "[wild-exec]   MADEIRA_WILD_EXEC_DUMP ignored (want plain hex, e.g. 141C5CFC0)\n" );
+    }
+    if (got >= 8)
+        for (i = 2; i < got / sizeof(ULONG_PTR); i++)   /* 2 = Rsp itself (the dump starts at Rsp-0x10) */
+        {
+            unsigned char b[6];
+            SIZE_T g2 = 0;
+            ULONG_PTR ret = stk[i];
+            if (!ios_probe_module( ret, &base, name, sizeof(name) )) continue;
+            if (NtReadVirtualMemory( GetCurrentProcess(), (void *)(ret - 6), b, sizeof(b), &g2 ) || g2 != 6) continue;
+            if (b[1] == 0xE8)
+            {
+                LONG rel = (LONG)((ULONG)b[2] | ((ULONG)b[3] << 8) | ((ULONG)b[4] << 16) | ((ULONG)b[5] << 24));
+                ULONG_PTR callee = ret + (LONG_PTR)rel;
+                ERR( "[wild-exec]   caller ret %p (%s+0x%llx) at rsp+%03x calls %p directly\n", (void *)ret, name,
+                     (unsigned long long)(ret - base), (unsigned)((i - 2) * 8), (void *)callee );
+                ios_wild_exec_hex( "[caller]", ret - 0x40, 0x48 );
+                ios_wild_exec_hex( "[callee]", callee, 0x200 );
+                break;
+            }
+            if (b[0] == 0xFF && b[1] == 0x15)
+            {
+                ERR( "[wild-exec]   caller ret %p (%s+0x%llx) at rsp+%03x calls through [rip+disp32]\n", (void *)ret, name,
+                     (unsigned long long)(ret - base), (unsigned)((i - 2) * 8) );
+                ios_wild_exec_hex( "[caller]", ret - 0x40, 0x48 );
+                break;
+            }
+        }
+    ios_fatal_probe( ctx );
+}
+
 static void ios_tlswatch_pe_arm( const char *where );
 NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 {
@@ -2914,6 +3213,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         if (sehent_n < 60 && InterlockedIncrement( &sehent_n ) <= 60)
             ERR( "[seh-entry] ctx=%p Rsp=%p Rip=%p\n", orig_context,
                  (void *)(ULONG_PTR)orig_context->Rsp, (void *)(ULONG_PTR)orig_context->Rip );
+        ios_wild_exec_probe( rec, orig_context );   /* madeira-bcd [wild-exec], log only */
 
     }
 
@@ -3552,12 +3852,33 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 }
 
 
+static void init_xcontext( struct xcontext *ctx, ARM64_NT_CONTEXT *arm_ctx )
+{
+    XSTATE *xs = (XSTATE *)(((ULONG_PTR)ctx->xs + 63) & ~63ull);
+
+    ctx->c_ex.Legacy.Length = sizeof(CONTEXT);
+    ctx->c_ex.Legacy.Offset = -(LONG)sizeof(CONTEXT);
+    ctx->c_ex.XState.Length = sizeof(*xs);
+    ctx->c_ex.XState.Offset = (char *)xs - (char *)&ctx->c_ex;
+    ctx->c_ex.All.Offset = ctx->c_ex.Legacy.Offset;
+    ctx->c_ex.All.Length = sizeof(CONTEXT) + ctx->c_ex.XState.Offset + ctx->c_ex.XState.Length;
+
+    xs->Mask = XSTATE_MASK_AVX & RtlGetEnabledExtendedFeatures( XSTATE_MASK_AVX );
+    xs->CompactionMask = 0;
+    memset( xs->Reserved, 0, sizeof(xs->Reserved) );
+
+    context_arm_to_x64( &ctx->c, arm_ctx, CONTEXT_AMD64_FULL | CONTEXT_AMD64_XSTATE );
+}
+
+
 /*******************************************************************
  *		KiUserEmulationDispatcher (NTDLL.@)
  */
 void dispatch_emulation( ARM64_NT_CONTEXT *arm_ctx )
 {
-    context_arm_to_x64( get_arm64ec_cpu_area()->ContextAmd64, arm_ctx );
+    struct xcontext *context = (void *)get_arm64ec_cpu_area()->ContextAmd64;
+
+    init_xcontext( context, arm_ctx );
     pBeginSimulation();
 }
 __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
@@ -3587,10 +3908,73 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
 }
 
 
-static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, ARM64EC_NT_CONTEXT *context, ARM64_NT_CONTEXT *arm_ctx )
+/* madeira-bcd [ccall-peek] (env MADEIRA_CCALL_PEEK_FIXUP = 0 turns it off).
+ *
+ * arm64x_check_call reads the first bytes of an x64 call target to spot the
+ * fast-forward, syscall and "jmp [rip+x]" sequences. That is an optimisation
+ * only: a target that is not one of them takes the exit thunk and the emulator
+ * runs it. Overwatch 2 keeps Overwatch.exe .text PAGE_NOACCESS and decrypts a
+ * page when x64 code first faults on it. On 0.2.57 (log 90020f6b) the peek hit
+ * such a page from native ntdll code: "Exception: Code: C0000005 Address:
+ * 70F0179074 AV READ of 1405431E0", host insn f9400170 = ldr x16,[x11], view
+ * vprot 20 (NOACCESS). The loader's x64 hook can't handle a fault in native
+ * code (it stepped Rip by 2: "AV EXEC of 154101076") and the game died 0xc0000005.
+ * So a read fault on one of those peeks resumes at the exit-thunk path, as if
+ * the bytes matched nothing; the emulator then fetches the target itself and
+ * the fault is an ordinary x64 one at the target, which is what the guest's
+ * handler expects. x11 still holds the target at every peek (it is only
+ * overwritten by a load that completed). Only this ntdll's own peek range is
+ * matched; Pc and the labels are both addresses in the code copy that ran. */
+extern const char madeira_ccall_peek_begin[], madeira_ccall_peek_exit[];
+
+static void ccall_peek_fixup( EXCEPTION_RECORD *rec, ARM64_NT_CONTEXT *arm_ctx )
+{
+    static LONG mode;   /* 0 not read yet, 1 off, 2 on */
+    ULONG_PTR pc = arm_ctx->Pc;
+
+    if (pc < (ULONG_PTR)madeira_ccall_peek_begin || pc >= (ULONG_PTR)madeira_ccall_peek_exit) return;
+    if (rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 0) return;   /* read faults only */
+    if (!mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_CCALL_PEEK_FIXUP" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    if (mode != 2) return;
+    {
+        static LONG n;
+        if (n < 16 && InterlockedIncrement( &n ) <= 16)
+            ERR( "[ccall-peek] #%ld read fault at %p on target %p (read of %p) -> exit thunk path rev=ccall-peek\n",
+                 n, (void *)pc, (void *)(ULONG_PTR)arm_ctx->X11, (void *)rec->ExceptionInformation[1] );
+    }
+    arm_ctx->Pc = (ULONG_PTR)madeira_ccall_peek_exit;
+    syscall_NtContinue( arm_ctx, FALSE );   /* returns only on failure: then dispatch as before */
+    arm_ctx->Pc = pc;
+}
+
+static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, struct xcontext *context, ARM64_NT_CONTEXT *arm_ctx )
 {
     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
-    context_arm_to_x64( context, arm_ctx );
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION) ccall_peek_fixup( rec, arm_ctx );
+    init_xcontext( context, arm_ctx );
+    /* rtcs-diag: the first 6 non-syscall exceptions whose hook pointer is NULL or differs from the value stored at init. */
+    if (rtcs_diag_enabled() && (!pResetToConsistentState || (void *)pResetToConsistentState != rtcs_diag_init) &&
+        rec->ExceptionCode != STATUS_EMULATION_SYSCALL && rtcs_diag_hits < 6 && InterlockedIncrement( &rtcs_diag_hits ) <= 6)
+    {
+        ERR( "[rtcs-ptr] exception #%d: code=%08x pc=%p pointer=%p stored-at-init=%p export=%p %s rev=rtcs-diag\n",
+             (int)rtcs_diag_hits, (unsigned int)rec->ExceptionCode, (void *)(ULONG_PTR)arm_ctx->Pc,
+             (void *)pResetToConsistentState, rtcs_diag_init, rtcs_diag_raw,
+             !pResetToConsistentState ? (rtcs_diag_init ? "NULL NOW, was set at init (cleared later)"
+                                                        : "NULL here (all three statics 0: page cleared or another ntdll instance)")
+                                      : "CHANGED since init" );
+        rtcs_diag_where( "exception" );
+    }
     /* iOS-Madeira task#34 probe: FEX's LogMan output is invisible on iOS (its
      * write(2) resolves to the PE CRT's WriteFile → unplumbed std handle),
      * so trace the guest-exception conversion from the wine side. Rate-
@@ -3675,7 +4059,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                         !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
                     {
-                        ULONG64 grsp = context->AMD64_Context.Rsp;
+                        ULONG64 grsp = context->c.AMD64_Context.Rsp;
                         SIZE_T qlen = 0;
                         MEMORY_BASIC_INFORMATION smbi;
 
@@ -3963,16 +4347,16 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
             }
             ERR( "[rtcs] pre: code=%08x addr=%p armPc=%p ecRip=%p rtcs=%p insim=%u\n",
                  (unsigned int)rec->ExceptionCode, rec->ExceptionAddress,
-                 (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)context->AMD64_Context.Rip,
+                 (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)context->c.AMD64_Context.Rip,
                  pResetToConsistentState, get_arm64ec_cpu_area()->InSimulation );
     }
-    if (pResetToConsistentState) pResetToConsistentState( rec, &context->AMD64_Context, arm_ctx );
+    if (pResetToConsistentState) pResetToConsistentState( rec, &context->c.AMD64_Context, arm_ctx );
     {
         static LONG rtcs_m;
         if (rtcs_m < 40 && InterlockedIncrement( &rtcs_m ) <= 40)
             ERR( "[rtcs] post: code=%08x addr=%p ecRip=%p ecRsp=%p armPc=%p\n",
                  (unsigned int)rec->ExceptionCode, rec->ExceptionAddress,
-                 (void *)(ULONG_PTR)context->AMD64_Context.Rip, (void *)(ULONG_PTR)context->AMD64_Context.Rsp,
+                 (void *)(ULONG_PTR)context->c.AMD64_Context.Rip, (void *)(ULONG_PTR)context->c.AMD64_Context.Rsp,
                  (void *)(ULONG_PTR)arm_ctx->Pc );
     }
     /* call x64 dispatcher if the thunk or the function pointer was modified */
@@ -3994,8 +4378,8 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
             if (kipath_n < 60 && InterlockedIncrement( &kipath_n ) <= 60)
                 ERR( "[ki-path] code=%08x ctx=%p Rsp=%p Rip=%p -> %s (patched=%d wow64=%p)\n",
                      (unsigned int)rec->ExceptionCode, context,
-                     (void *)(ULONG_PTR)context->AMD64_Context.Rsp,
-                     (void *)(ULONG_PTR)context->AMD64_Context.Rip,
+                     (void *)(ULONG_PTR)context->c.AMD64_Context.Rsp,
+                     (void *)(ULONG_PTR)context->c.AMD64_Context.Rip,
                      (pWow64PrepareForException || patched) ? "x64-THUNK (guest hook runs)" : "direct dispatch",
                      patched, pWow64PrepareForException );
         }
@@ -4005,6 +4389,77 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
     return NULL;
 }
 
+/* madeira-bcd [ki-legacy-frame] (env MADEIRA_KI_LEGACY_FRAME = 0 turns it off).
+ *
+ * Wine 11.x grew the KiUserExceptionDispatcher frame from ARM64EC_NT_CONTEXT
+ * (0x4d0) to struct xcontext (0x670: + CONTEXT_EX + XSTATE), so for x64 code
+ * the ARM64 context now sits at rsp+0x670 and the EXCEPTION_RECORD at
+ * rsp+0xa20 instead of rsp+0x4d0 / rsp+0x880. Overwatch 2's loader hooks the
+ * x64 dispatcher (it sets Wow64PrepareForException and handles its own int3
+ * checks there). On bnettest23 (old frame) the hook handled the first int3 and
+ * resumed ("[pool-rip-fix] #8 ... invoke_arm64ec_syscall", then "[set-ctx]");
+ * on 0.2.47 (new frame) it declines the same int3 at Overwatch_loader+0x871be0,
+ * the loader's SEH handler writes a dump and the process ends 0x80000003.
+ * So when the x64 hook path is taken, hand x64 code the old frame: move the
+ * CONTEXT up by 0x1a0 so it ends right where the ARM64 context starts, and drop
+ * CONTEXT_XSTATE from it (its CONTEXT_EX is overwritten). Only the hooked path
+ * changes; the native dispatcher keeps the 11.x frame. Returns the shift.
+ * The 11.x frame also sets CONTEXT_XSTATE and fills CONTEXT_EX, which is the
+ * other suspected cause: MADEIRA_KI_LEGACY_FRAME = 2 keeps the new frame and only
+ * drops CONTEXT_XSTATE. */
+static LONG ki_legacy_frame_mode;   /* 0 not read yet, 1 off, 2 on (shift + no XSTATE), 3 XSTATE flag only */
+
+static ULONG_PTR __attribute__((used)) ki_legacy_frame_enter( struct xcontext *ctx )
+{
+    CONTEXT *moved;
+
+    if (!ki_legacy_frame_mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_KI_LEGACY_FRAME" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        ki_legacy_frame_mode = 2;
+        if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length == sizeof(WCHAR))
+        {
+            if (buffer[0] == '0') ki_legacy_frame_mode = 1;
+            else if (buffer[0] == '2') ki_legacy_frame_mode = 3;
+        }
+    }
+    if (ki_legacy_frame_mode == 1) return 0;
+    if (ki_legacy_frame_mode == 3)
+    {
+        /* = 2: keep the 11.x frame, only drop CONTEXT_XSTATE (tells the two
+         * suspected causes apart). */
+        ctx->c.AMD64_Context.ContextFlags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
+        return 0;
+    }
+
+    moved = (CONTEXT *)((char *)ctx + sizeof(struct xcontext) - sizeof(ARM64EC_NT_CONTEXT));
+    memmove( moved, &ctx->c, sizeof(ARM64EC_NT_CONTEXT) );
+    moved->ContextFlags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
+    {
+        static LONG kl_n;
+        if (kl_n < 8 && InterlockedIncrement( &kl_n ) <= 8)
+            ERR( "[ki-legacy-frame] #%ld x64 hook gets the 0x4d0 frame: ctx %p -> %p rec at %p rev=ki-legacy-frame\n",
+                 kl_n, ctx, moved, (char *)moved + sizeof(ARM64EC_NT_CONTEXT) + 0x3b0 );
+    }
+    return sizeof(struct xcontext) - sizeof(ARM64EC_NT_CONTEXT);
+}
+
+/* The x64 hook returned instead of resuming (not expected; Windows gives it no
+ * return address). Put the CONTEXT back so the native dispatcher below sees a
+ * normal frame; XSTATE stays dropped. */
+static void __attribute__((used)) ki_legacy_frame_leave( struct xcontext *ctx )
+{
+    CONTEXT *moved = (CONTEXT *)((char *)ctx + sizeof(struct xcontext) - sizeof(ARM64EC_NT_CONTEXT));
+
+    memmove( &ctx->c, moved, sizeof(ARM64EC_NT_CONTEXT) );
+}
+
 /*******************************************************************
  *		KiUserExceptionDispatcher (NTDLL.@)
  */
@@ -4012,12 +4467,12 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
 {
     asm( ".seh_proc \"#KiUserExceptionDispatcher\"\n\t"
          ".seh_context\n\t"
-         "sub sp, sp, #0x4d0\n\t"       /* sizeof(ARM64EC_NT_CONTEXT) */
-         ".seh_stackalloc 0x4d0\n\t"
+         "sub sp, sp, #0x670\n\t"       /* sizeof(xcontext) */
+         ".seh_stackalloc 0x670\n\t"
          ".seh_endprologue\n\t"
-         "add x0, sp, #0x3b0+0x4d0\n\t" /* rec */
+         "add x0, sp, #0x3b0+0x670\n\t" /* rec */
          "mov x1, sp\n\t"               /* context */
-         "add x2, sp, #0x4d0\n\t"       /* arm_ctx (context + 1) */
+         "add x2, sp, #0x670\n\t"       /* arm_ctx (context + 1) */
          "bl \"#prepare_exception_arm64ec\"\n\t"
          "cbz x0, 1f\n\t"
          /* bypass exit thunk to avoid messing up the stack */
@@ -4031,9 +4486,25 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
           * optimization; label 1 (dispatch_exception) is the full, correct
           * ARM64EC SEH dispatcher. So if the slot is NULL, fall through to it. */
          "cbz x16, 1f\n\t"
-         "mov x9, x0\n\t"
-         "blr x16\n"
-         "1:\tadd x0, sp, #0x3b0+0x4d0\n\t" /* rec */
+         /* madeira-bcd [ki-legacy-frame]: x19/x20 hold the target and the
+          * dispatch helper across the C call, x21 the shift (x19-x22 are
+          * r12-r15 for x64 code, preserved if it ever returns). This function
+          * never returns, so the callee-saved registers are free here. */
+         "mov x19, x0\n\t"
+         "mov x20, x16\n\t"
+         "mov x0, sp\n\t"
+         "bl \"#ki_legacy_frame_enter\"\n\t"
+         "mov x21, x0\n\t"
+         "add sp, sp, x21\n\t"
+         "mov x9, x19\n\t"
+         "mov x16, x20\n\t"
+         "mov x0, x19\n\t"                /* x64 code sees rcx = target, as before */
+         "blr x16\n\t"
+         "sub sp, sp, x21\n\t"
+         "cbz x21, 1f\n\t"
+         "mov x0, sp\n\t"
+         "bl \"#ki_legacy_frame_leave\"\n"
+         "1:\tadd x0, sp, #0x3b0+0x670\n\t" /* rec */
          "mov x1, sp\n\t"                   /* context */
          "bl #dispatch_exception\n\t"
          "brk #1\n\t"
@@ -4048,11 +4519,11 @@ static void __attribute__((used)) dispatch_apc( void (CALLBACK *func)(ULONG_PTR,
                                                 ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
                                                 BOOLEAN alertable, ARM64_NT_CONTEXT *arm_ctx )
 {
-    ARM64EC_NT_CONTEXT context;
+    struct xcontext context;
 
-    context_arm_to_x64( &context, arm_ctx );
-    func( arg1, arg2, arg3, &context.AMD64_Context );
-    NtContinue( &context.AMD64_Context, alertable );
+    init_xcontext( &context, arm_ctx );
+    func( arg1, arg2, arg3, &context.c.AMD64_Context );
+    NtContinue( &context.c.AMD64_Context, alertable );
 }
 __ASM_GLOBAL_FUNC( "#KiUserApcDispatcher",
                    ".seh_context\n\t"
@@ -4283,7 +4754,7 @@ void __attribute__((naked)) RtlCaptureContext( CONTEXT *context )
 /* fixup jump buffer information; helper for _setjmpex */
 static int __attribute__((used)) do_setjmpex( _JUMP_BUFFER *buf, UINT fpcr, UINT fpsr )
 {
-    CONTEXT context = { .ContextFlags = CONTEXT_FULL };
+    CONTEXT context = { .ContextFlags = CONTEXT_AMD64_FULL };
 
     buf->MxCsr = fpcsr_to_mxcsr( fpcr, fpsr );
     buf->FpCsr = 0x27f;
@@ -4401,6 +4872,9 @@ static void __attribute__((naked,noreturn)) consolidate_callback( CONTEXT *conte
          "stp x6, x7, [x4], #16\n\t"
          "subs x5, x5, #1\n\t"
          "b.ne 1b\n\t"
+         "ldr w5, [sp, #0x30]\n\t"  /* ContextFlags */
+         "and w5, w5, #~0x40\n\t"
+         "str w5, [sp, #0x30]\n\t"
          "mov x0, x2\n\t"           /* rec */
          "b invoke_callback\n\t"
          ".seh_endproc\n\t"
@@ -4755,6 +5229,16 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
 }
 
 
+/**********************************************************************
+ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
+ */
+ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
+{
+    if (!emulated_processor_features[PF_AVX_INSTRUCTIONS_AVAILABLE]) return 0;
+    return user_shared_data->XState.EnabledFeatures & feature_mask;
+}
+
+
 /*************************************************************************
  *		RtlWalkFrameChain (NTDLL.@)
  */
@@ -4905,11 +5389,12 @@ static void __attribute__((naked)) arm64x_check_call(void)
          /* check if dest is aligned */
          "tst x11, #15\n\t"                 /* dest & 15 */
          "b.ne .Ljmp\n\t"
+         "madeira_ccall_peek_begin:\n\t"   /* [ccall-peek]: loads from [x11] start here */
          "ldr x16, [x11]\n\t"               /* dest code */
          /* check for fast-forward sequence */
          "ldr x17, .Lffwd_seq\n\t"
          "cmp x16, x17\n\t"
-         "b.ne .Lsyscall\n\t"
+         "b.ne .Lhotpatch\n\t"
          "ldr x16, [x11, #8]\n\t"
          "ldr x17, .Lffwd_seq + 8\n\t"
          "eor x17, x16, x17\n\t"            /* compare only first two bytes */
@@ -4919,6 +5404,19 @@ static void __attribute__((naked)) arm64x_check_call(void)
          "lsr x9, x16, #16\n\t"
          "add x11, x11, w9, sxtw\n\t"       /* add offset */
          "ret\n"
+         /* Madeira [hotpatch-thunks]: hotpatch prologue (lea 0x0(%rsp),%rsp) that the loader puts
+          * before x64 export thunks when env MADEIRA_ARM64X_HOTPATCH_THUNKS = 1; step over it to
+          * the jmp, only when an ff 25 jmp follows (idea: DroidDeck-Proton 269ca79) */
+         ".Lhotpatch:\n\t"
+         "ldr x17, .Lhotpatch_seq\n\t"
+         "cmp x16, x17\n\t"
+         "b.ne .Lsyscall\n\t"
+         "ldrh w17, [x11, #8]\n\t"
+         "mov w9, #0x25ff\n\t"             /* ff 25 */
+         "cmp w17, w9\n\t"
+         "b.ne .Lsyscall\n\t"
+         "add x11, x11, #8\n\t"
+         "b .Ljmp\n"
          /* check for syscall sequence */
          ".Lsyscall:\n\t"
          "ldr w17, .Lsyscall_seq\n\t"
@@ -4951,6 +5449,7 @@ static void __attribute__((naked)) arm64x_check_call(void)
          "ldr x11, [x16, w9, sxtw]\n\t"
          "b \"#arm64x_check_call\"\n"       /* restart checks with jump destination */
          /* not a special sequence, call the exit thunk */
+         "madeira_ccall_peek_exit:\n\t"    /* [ccall-peek]: a faulting peek resumes here */
          ".Lexit:\n\t"
          "mov x9, x11\n\t"
          "mov x11, x10\n\t"
@@ -4958,6 +5457,9 @@ static void __attribute__((naked)) arm64x_check_call(void)
          "ret\n"
          ".seh_endproc\n\t"
 
+         ".balign 8\n"                      /* keep the 8-byte literals aligned */
+         ".Lhotpatch_seq:\n\t"
+         ".byte 0x48, 0x8d, 0xa4, 0x24, 0, 0, 0, 0\n"  /* lea 0x0(%rsp),%rsp */
          ".Lffwd_seq:\n\t"
          ".byte 0x48, 0x8b, 0xc4\n\t"       /* mov  %rsp,%rax */
          ".byte 0x48, 0x89, 0x58, 0x20\n\t" /* mov  %rbx,0x20(%rax) */
@@ -5127,7 +5629,7 @@ void __attribute__((naked)) RtlUserThreadStart( PRTL_THREAD_START_ROUTINE entry,
  */
 void WINAPI LdrInitializeThunk( CONTEXT *arm_context, ULONG_PTR unk2, ULONG_PTR unk3, ULONG_PTR unk4 )
 {
-    ARM64EC_NT_CONTEXT context;
+    struct xcontext context;
 
     if (!__os_arm64x_check_call)
     {
@@ -5138,10 +5640,10 @@ void WINAPI LdrInitializeThunk( CONTEXT *arm_context, ULONG_PTR unk2, ULONG_PTR 
         __os_arm64x_set_x64_information = LdrpSetX64Information;
     }
 
-    context_arm_to_x64( &context, (ARM64_NT_CONTEXT *)arm_context );
-    loader_init( &context.AMD64_Context, (void **)&context.X0 );
-    TRACE_(relay)( "\1Starting thread proc %p (arg=%p)\n", (void *)context.X0, (void *)context.X1 );
-    NtContinue( &context.AMD64_Context, TRUE );
+    init_xcontext( &context, (ARM64_NT_CONTEXT *)arm_context );
+    loader_init( &context.c.AMD64_Context, (void **)&context.c.X0 );
+    TRACE_(relay)( "\1Starting thread proc %p (arg=%p)\n", (void *)context.c.X0, (void *)context.c.X1 );
+    NtContinue( &context.c.AMD64_Context, TRUE );
 }
 
 

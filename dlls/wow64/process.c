@@ -212,6 +212,9 @@ static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const 
             break;
         case PS_ATTRIBUTE_GROUP_AFFINITY:
             {
+                /* Window boundary (Madeira): Value is a guest address.  11.22 converts the
+                 * structure itself (the mask is 4 bytes in the guest, 8 on the host), which
+                 * replaces our pointer-only conversion. */
                 GROUP_AFFINITY32 *aff32 = guest_ptr32( attr32->Attributes[i].Value );
                 GROUP_AFFINITY *aff64;
                 ret->Attributes[i].Size     = sizeof(GROUP_AFFINITY);

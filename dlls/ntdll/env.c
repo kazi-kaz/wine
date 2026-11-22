@@ -78,6 +78,20 @@ static void set_wow64_environment( WCHAR **env )
     if (!is_win64 && NtCurrentTeb()->WowTebOffset)
     {
         RtlWow64GetProcessMachines( GetCurrentProcess(), NULL, &machine );
+        /* madeira [guest-machine-x64]: a 32-bit x86 program on this ARM64 host is told
+         * it runs on an x64 PC (see IsWow64Process2 in kernelbase).
+         * Only with MADEIRA_GUEST_MACHINE_X64 = 1; off by default. */
+        if (machine == IMAGE_FILE_MACHINE_ARM64 &&
+            RtlImageNtHeader( NtCurrentTeb()->Peb->ImageBaseAddress )->FileHeader.Machine == IMAGE_FILE_MACHINE_I386)
+        {
+            WCHAR off_buf[4];
+            UNICODE_STRING off_nameW = RTL_CONSTANT_STRING( L"MADEIRA_GUEST_MACHINE_X64" );
+            UNICODE_STRING off_valW = { 0, sizeof(off_buf), off_buf };
+
+            if (!RtlQueryEnvironmentVariable_U( *env, &off_nameW, &off_valW ) &&
+                off_valW.Length == sizeof(WCHAR) && off_buf[0] == '1')
+                machine = IMAGE_FILE_MACHINE_AMD64;
+        }
         RtlSetEnvironmentVariable( env, &arch6432_strW, get_machine_name( machine, &nameW ));
     }
     else RtlSetEnvironmentVariable( env, &arch6432_strW, NULL );

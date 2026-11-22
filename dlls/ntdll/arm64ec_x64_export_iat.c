@@ -62,12 +62,19 @@ int arm64ec_iat_slot_is_x64_export(const void *module, size_t size,
         int32_t displacement;
         int64_t target;
 
+        uint32_t at, end;
+
         if (!rva || !inside(size, rva, 6)) continue;
         /* EAT entries within the export directory are strings, not code. */
         if (rva >= exports && (uint64_t)rva < (uint64_t)exports + export_size) continue;
-        if (image[rva] != 0xff || image[rva + 1] != 0x25) continue;
-        memcpy(&displacement, image + rva + 2, sizeof(displacement));
-        target = (int64_t)rva + 6 + displacement;
+        /* iOS-Madeira [hotpatch-thunks]: with env MADEIRA_ARM64X_HOTPATCH_THUNKS = 1 the loader
+         * puts "48 8d a4 24 00 00 00 00" (lea 0x0(%rsp),%rsp) before the jmp; look past it. */
+        at = rva;
+        if (inside(size, rva, 14) && !memcmp(image + rva, "\x48\x8d\xa4\x24\0\0\0\0", 8)) at = rva + 8;
+        end = at + 6;
+        if (image[at] != 0xff || image[at + 1] != 0x25) continue;
+        memcpy(&displacement, image + at + 2, sizeof(displacement));
+        target = (int64_t)at + 6 + displacement;
         if (target != slot) continue;
 
         /* Do not mistake ARM64 bytes or arbitrary data for x64 instructions. */
@@ -78,7 +85,7 @@ int arm64ec_iat_slot_is_x64_export(const void *module, size_t size,
             if ((start & 3) != 2) continue;
             start &= ~3u;
             if (!inside(size, start, length)) continue;
-            if (rva >= start && (uint64_t)rva + 6 <= (uint64_t)start + length) return 1;
+            if (rva >= start && (uint64_t)end <= (uint64_t)start + length) return 1;
         }
     }
     return 0;

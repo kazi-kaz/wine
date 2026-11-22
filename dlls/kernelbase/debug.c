@@ -453,6 +453,311 @@ static void format_exception_msg( const EXCEPTION_POINTERS *ptr, char *buffer, i
 }
 
 
+/* (crash-report) A short report of an unhandled crash in madeira-log.txt: registers, stack, a backtrace and the loaded modules,
+ * each line starting [crash-report]. Printed once, before winedbg is tried (winedbg is not shipped here, so the stock
+ * "Couldn't start debugger" line says nothing). Off: env.MADEIRA_CRASH_REPORT = 0. Fixed buffers, no heap, no locks, memory read
+ * only through NtReadVirtualMemory, so a damaged stack or heap cannot stop it. Pure text helpers sit between the pure-begin and
+ * pure-end markers: tests/host/check-crash-report.py compiles just that part on the host.
+ * Not covered: processes that set SEM_NOGPFAULTERRORBOX or whose top-level filter handles the crash, games with their own
+ * crash handler, and fast-fail c0000409: no block appears there. */
+/* crash-report-pure-begin */
+#define CRASH_UNUSED __attribute__((unused))
+#define CRASH_LINE 400
+struct crash_mod { unsigned long long base; unsigned int size; char name[24]; };
+struct crash_line { char s[CRASH_LINE]; unsigned int n; };
+
+static CRASH_UNUSED void crash_str( struct crash_line *l, const char *s )
+{
+    while (*s && l->n < CRASH_LINE - 2) l->s[l->n++] = *s++;
+    l->s[l->n] = 0;
+}
+
+static CRASH_UNUSED void crash_hex( struct crash_line *l, unsigned long long v, int digits )
+{
+    char t[17];
+    int i = 0;
+    do { t[i++] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v && i < 16);
+    while (i < digits && i < 16) t[i++] = '0';
+    while (i && l->n < CRASH_LINE - 2) l->s[l->n++] = t[--i];
+    l->s[l->n] = 0;
+}
+
+static CRASH_UNUSED void crash_end_line( struct crash_line *l )
+{
+    l->s[l->n++] = '\n';
+    l->s[l->n] = 0;
+}
+
+static CRASH_UNUSED const struct crash_mod *crash_find_module( const struct crash_mod *mods, unsigned int count, unsigned long long addr )
+{
+    unsigned int i;
+    for (i = 0; i < count; i++)
+        if (addr >= mods[i].base && addr - mods[i].base < mods[i].size) return &mods[i];
+    return NULL;
+}
+
+/* "0x00b57aa9 (FalloutNV.exe+0x1a2b)" when a module holds addr, else just "0x00b57aa9" */
+static CRASH_UNUSED void crash_addr( struct crash_line *l, const struct crash_mod *mods, unsigned int count, unsigned long long addr, int digits )
+{
+    const struct crash_mod *m = crash_find_module( mods, count, addr );
+    crash_str( l, "0x" );
+    crash_hex( l, addr, digits );
+    if (!m) return;
+    crash_str( l, " (" );
+    crash_str( l, m->name );
+    crash_str( l, "+0x" );
+    crash_hex( l, addr - m->base, 0 );
+    crash_str( l, ")" );
+}
+/* crash-report-pure-end */
+
+#if defined(__i386__) || defined(__x86_64__) || defined(__arm64ec__)
+#define CRASH_MAX_MODS 192
+#define CRASH_SLOTS 256
+
+static LONG crash_report_done;
+static BOOL crash_report_off;   /* env.MADEIRA_CRASH_REPORT = 0, read once at start so the crash path never touches the environment or the PEB lock */
+static struct crash_mod crash_mods[CRASH_MAX_MODS];
+static ULONG_PTR crash_stack[CRASH_SLOTS];
+static struct crash_line crash_text;
+
+static BOOL crash_read( const void *from, void *to, SIZE_T len, SIZE_T *got )
+{
+    SIZE_T n = 0;
+    NTSTATUS status = NtReadVirtualMemory( GetCurrentProcess(), from, to, len, &n );
+    if (got) { *got = n; return !status || n; }
+    return !status && n == len;   /* without a length out, only a whole read counts */
+}
+
+static void crash_flush( void )
+{
+    crash_end_line( &crash_text );
+    __wine_dbg_write( crash_text.s, crash_text.n );   /* not __wine_dbg_output: it adds to a half line this thread had buffered, and can raise */
+    crash_text.n = 0;
+    crash_text.s[0] = 0;
+}
+
+static void crash_begin( void )
+{
+    crash_text.n = 0;
+    crash_str( &crash_text, "[crash-report] " );
+}
+
+static unsigned int crash_collect_modules( void )
+{
+    PEB *peb = NtCurrentTeb()->Peb;
+    LIST_ENTRY head, *e;
+    unsigned int n = 0, guard = 0;
+
+    if (!peb || !crash_read( &peb->LdrData, &e, sizeof(e), NULL) || !e) return 0;
+    {
+        PEB_LDR_DATA *ldr = (PEB_LDR_DATA *)e;
+        if (!crash_read( &ldr->InMemoryOrderModuleList, &head, sizeof(head), NULL)) return 0;
+        e = head.Flink;
+        while (e && e != &ldr->InMemoryOrderModuleList && n < CRASH_MAX_MODS && guard++ < 1024)
+        {
+            static LDR_DATA_TABLE_ENTRY ent;
+            static WCHAR name[24];
+            SIZE_T got, i;
+            LDR_DATA_TABLE_ENTRY *at = CONTAINING_RECORD( e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks );
+            if (!crash_read( at, &ent, sizeof(ent), NULL)) break;
+            if (ent.DllBase)
+            {
+                crash_mods[n].base = (ULONG_PTR)ent.DllBase;
+                crash_mods[n].size = ent.SizeOfImage;
+                crash_mods[n].name[0] = 0;
+                if (ent.BaseDllName.Buffer && crash_read( ent.BaseDllName.Buffer, name, sizeof(name) - sizeof(WCHAR), &got ))
+                {
+                    SIZE_T chars = min( got / sizeof(WCHAR), (SIZE_T)ent.BaseDllName.Length / sizeof(WCHAR) );
+                    if (chars > 23) chars = 23;
+                    for (i = 0; i < chars; i++) crash_mods[n].name[i] = name[i] < 128 && name[i] >= 32 ? (char)name[i] : '?';
+                    crash_mods[n].name[chars] = 0;
+                }
+                n++;
+            }
+            e = ent.InMemoryOrderLinks.Flink;
+        }
+    }
+    return n;
+}
+
+void crash_report_init(void)
+{
+    WCHAR on[8];
+    DWORD len = GetEnvironmentVariableW( L"MADEIRA_CRASH_REPORT", on, ARRAY_SIZE(on) );
+    if (len && len < ARRAY_SIZE(on) && on[0] == '0') crash_report_off = TRUE;
+}
+
+static unsigned char crash_used[CRASH_MAX_MODS];
+static unsigned int crash_nmods;
+
+/* the module table lists the exe and the modules the printed addresses fall in */
+static void crash_mark( unsigned long long addr )
+{
+    const struct crash_mod *m = crash_find_module( crash_mods, crash_nmods, addr );
+    if (m) crash_used[m - crash_mods] = 1;
+}
+
+static void crash_report( EXCEPTION_POINTERS *ep )
+{
+    const int dg = sizeof(void *) * 2;
+    static EXCEPTION_RECORD rec;   /* static: after a stack overflow there is no room for them on the stack */
+    static CONTEXT ctx;
+    unsigned int count, i, shown;
+    ULONG_PTR sp, bp, ip, top;
+    SIZE_T got, slots, want;
+
+    if (crash_report_off) return;
+    if (InterlockedCompareExchange( &crash_report_done, 1, 0 )) return;
+    if (!ep || !crash_read( ep->ExceptionRecord, &rec, sizeof(rec), NULL) || !crash_read( ep->ContextRecord, &ctx, sizeof(ctx), NULL)) return;
+
+    count = crash_collect_modules();
+    crash_nmods = count;
+    if (count) crash_used[0] = 1;
+#ifdef __i386__
+    sp = ctx.Esp; bp = ctx.Ebp; ip = ctx.Eip;
+#else
+    sp = ctx.Rsp; bp = ctx.Rbp; ip = ctx.Rip;
+#endif
+
+    crash_mark( (ULONG_PTR)rec.ExceptionAddress );
+    crash_mark( ip );
+    crash_begin();
+    crash_str( &crash_text, sizeof(void *) == 4 ? "32-bit guest, exception 0x" : "64-bit guest, exception 0x" );
+    crash_hex( &crash_text, rec.ExceptionCode, 8 );
+    crash_str( &crash_text, " at " );
+    crash_addr( &crash_text, crash_mods, count, (ULONG_PTR)rec.ExceptionAddress, dg );
+    crash_str( &crash_text, ", thread 0x" );
+    crash_hex( &crash_text, GetCurrentThreadId(), 0 );
+    crash_str( &crash_text, ", process " );
+    crash_str( &crash_text, count ? crash_mods[0].name : "?" );
+    crash_flush();
+    if (rec.ExceptionCode == STATUS_ACCESS_VIOLATION && rec.NumberParameters >= 2)
+    {
+        crash_begin();
+        crash_str( &crash_text, rec.ExceptionInformation[0] == 0 ? "access violation: read of 0x" :
+                                rec.ExceptionInformation[0] == 1 ? "access violation: write to 0x" : "access violation: execute at 0x" );
+        crash_hex( &crash_text, rec.ExceptionInformation[1], dg );
+        crash_flush();
+    }
+
+    crash_begin();
+#ifdef __i386__
+    crash_str( &crash_text, "eax=" ); crash_hex( &crash_text, ctx.Eax, 8 );
+    crash_str( &crash_text, " ebx=" ); crash_hex( &crash_text, ctx.Ebx, 8 );
+    crash_str( &crash_text, " ecx=" ); crash_hex( &crash_text, ctx.Ecx, 8 );
+    crash_str( &crash_text, " edx=" ); crash_hex( &crash_text, ctx.Edx, 8 );
+    crash_flush(); crash_begin();
+    crash_str( &crash_text, "esi=" ); crash_hex( &crash_text, ctx.Esi, 8 );
+    crash_str( &crash_text, " edi=" ); crash_hex( &crash_text, ctx.Edi, 8 );
+    crash_str( &crash_text, " ebp=" ); crash_hex( &crash_text, ctx.Ebp, 8 );
+    crash_str( &crash_text, " esp=" ); crash_hex( &crash_text, ctx.Esp, 8 );
+    crash_str( &crash_text, " eip=" ); crash_hex( &crash_text, ctx.Eip, 8 );
+    crash_str( &crash_text, " eflags=" ); crash_hex( &crash_text, ctx.EFlags, 8 );
+#else
+    crash_str( &crash_text, "rax=" ); crash_hex( &crash_text, ctx.Rax, 16 );
+    crash_str( &crash_text, " rbx=" ); crash_hex( &crash_text, ctx.Rbx, 16 );
+    crash_str( &crash_text, " rcx=" ); crash_hex( &crash_text, ctx.Rcx, 16 );
+    crash_str( &crash_text, " rdx=" ); crash_hex( &crash_text, ctx.Rdx, 16 );
+    crash_flush(); crash_begin();
+    crash_str( &crash_text, "rsi=" ); crash_hex( &crash_text, ctx.Rsi, 16 );
+    crash_str( &crash_text, " rdi=" ); crash_hex( &crash_text, ctx.Rdi, 16 );
+    crash_str( &crash_text, " rbp=" ); crash_hex( &crash_text, ctx.Rbp, 16 );
+    crash_str( &crash_text, " rsp=" ); crash_hex( &crash_text, ctx.Rsp, 16 );
+    crash_flush(); crash_begin();
+    crash_str( &crash_text, "r8=" ); crash_hex( &crash_text, ctx.R8, 16 );
+    crash_str( &crash_text, " r9=" ); crash_hex( &crash_text, ctx.R9, 16 );
+    crash_str( &crash_text, " r10=" ); crash_hex( &crash_text, ctx.R10, 16 );
+    crash_str( &crash_text, " r11=" ); crash_hex( &crash_text, ctx.R11, 16 );
+    crash_flush(); crash_begin();
+    crash_str( &crash_text, "r12=" ); crash_hex( &crash_text, ctx.R12, 16 );
+    crash_str( &crash_text, " r13=" ); crash_hex( &crash_text, ctx.R13, 16 );
+    crash_str( &crash_text, " r14=" ); crash_hex( &crash_text, ctx.R14, 16 );
+    crash_str( &crash_text, " r15=" ); crash_hex( &crash_text, ctx.R15, 16 );
+    crash_flush(); crash_begin();
+    crash_str( &crash_text, "rip=" ); crash_hex( &crash_text, ctx.Rip, 16 );
+    crash_str( &crash_text, " eflags=" ); crash_hex( &crash_text, ctx.EFlags, 8 );
+#endif
+    crash_flush();
+
+    /* the stack from the stack pointer: raw words, then the backtrace */
+    slots = 0;
+    top = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
+    want = sizeof(crash_stack);
+    if (sp < top && top - sp < want) want = top - sp;   /* a read is all or nothing: stop at the stack's end */
+    for (; want >= sizeof(ULONG_PTR); want /= 2)
+        if (crash_read( (void *)sp, crash_stack, want, &got ) && got >= sizeof(ULONG_PTR)) { slots = got / sizeof(ULONG_PTR); break; }
+    for (i = 0; i < slots && i < 64 / (sizeof(void *) / 4); i += 8 / (sizeof(void *) / 4))
+    {
+        unsigned int j;
+        crash_begin();
+        crash_str( &crash_text, "stack " );
+        crash_hex( &crash_text, sp + i * sizeof(ULONG_PTR), dg );
+        crash_str( &crash_text, ":" );
+        for (j = 0; j < 8 / (sizeof(void *) / 4) && i + j < slots; j++)
+        {
+            crash_str( &crash_text, " " );
+            crash_hex( &crash_text, crash_stack[i + j], dg );
+        }
+        crash_flush();
+    }
+
+    crash_begin();
+    crash_str( &crash_text, "backtrace (frame chain; meaningless in code without frame pointers): " );
+    crash_addr( &crash_text, crash_mods, count, ip, dg );
+    crash_flush();
+    for (i = 0, shown = 0; i < 32 && bp && !(bp & (sizeof(void *) - 1)); i++)
+    {
+        ULONG_PTR frame[2];
+        if (!crash_read( (void *)bp, frame, sizeof(frame), &got ) || got < sizeof(frame)) break;
+        crash_begin();
+        crash_mark( frame[1] );
+        crash_str( &crash_text, "  from " );
+        crash_addr( &crash_text, crash_mods, count, frame[1], dg );
+        crash_flush();
+        shown++;
+        if (frame[0] <= bp) break;
+        bp = frame[0];
+    }
+    crash_begin();
+    crash_str( &crash_text, "stack scan (GUESSES: values on the stack that point into a loaded module; a game built without frame pointers has no chain):" );
+    crash_flush();
+    for (i = 0, shown = 0; i < slots && shown < 24; i++)
+    {
+        const struct crash_mod *m = crash_find_module( crash_mods, count, crash_stack[i] );
+        if (!m) continue;
+        crash_begin();
+        crash_mark( crash_stack[i] );
+        crash_str( &crash_text, "  (scan) " );
+        crash_addr( &crash_text, crash_mods, count, crash_stack[i], dg );
+        crash_flush();
+        shown++;
+    }
+
+    crash_begin();
+    crash_str( &crash_text, "modules (the exe and the ones the addresses above fall in):" );
+    crash_flush();
+    for (i = 0; i < count; i++)
+    {
+        if (!crash_used[i]) continue;
+        crash_begin();
+        crash_str( &crash_text, "  " );
+        crash_hex( &crash_text, crash_mods[i].base, dg );
+        crash_str( &crash_text, " size 0x" );
+        crash_hex( &crash_text, crash_mods[i].size, 0 );
+        crash_str( &crash_text, " " );
+        crash_str( &crash_text, crash_mods[i].name );
+        crash_flush();
+    }
+    crash_begin();
+    crash_str( &crash_text, "end" );
+    crash_flush();
+}
+#else
+void crash_report_init(void) {}
+static void crash_report( EXCEPTION_POINTERS *ep ) {}
+#endif
+
 /******************************************************************
  *		start_debugger
  *
@@ -470,6 +775,7 @@ static BOOL start_debugger( EXCEPTION_POINTERS *epointers, HANDLE event )
     BOOL ret = FALSE;
     char buffer[256];
 
+    crash_report( epointers );   /* (crash-report) MADEIRA_CRASH_REPORT = 0 turns it off */
     format_exception_msg( epointers, buffer, sizeof(buffer) );
     MESSAGE( "wine: %s (thread %04lx), starting debugger...\n", buffer, GetCurrentThreadId() );
 

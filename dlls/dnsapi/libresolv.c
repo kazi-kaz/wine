@@ -480,10 +480,10 @@ static NTSTATUS wow64_get_hostinfo( void *args )
 
     struct get_hostinfo_params params =
     {
-        ULongToPtr(params32->name),
-        ULongToPtr(params32->cname),
-        ULongToPtr(params32->ip4),
-        ULongToPtr(params32->ip6)
+        ios_wow_host_ptr(params32->name),
+        ios_wow_host_ptr(params32->cname),
+        ios_wow_host_ptr(params32->ip4),
+        ios_wow_host_ptr(params32->ip6)
     };
 
     return get_hostinfo( &params );

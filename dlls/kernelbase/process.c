@@ -258,9 +258,7 @@ static NTSTATUS create_nt_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBUT
                                    SECURITY_ATTRIBUTES *tsa, DWORD process_flags,
                                    RTL_USER_PROCESS_PARAMETERS *params,
                                    RTL_USER_PROCESS_INFORMATION *info,
-                                   HANDLE parent, USHORT machine,
-                                   const struct proc_thread_attr *handle_list,
-                                   const struct proc_thread_attr *job_list)
+                                   const struct _PROC_THREAD_ATTRIBUTE_LIST *attrs )
 {
     OBJECT_ATTRIBUTES process_attr, thread_attr;
     PS_CREATE_INFO create_info;
@@ -271,86 +269,106 @@ static NTSTATUS create_nt_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBUT
     UINT pos = 0;
 
     if (!params->ImagePathName.Buffer[0]) return STATUS_OBJECT_PATH_NOT_FOUND;
-    status = RtlDosPathNameToNtPathName_U_WithStatus( params->ImagePathName.Buffer, &nameW, NULL, NULL );
-    if (!status)
-    {
-        RtlNormalizeProcessParams( params );
+    if ((status = RtlDosPathNameToNtPathName_U_WithStatus( params->ImagePathName.Buffer, &nameW, NULL, NULL )))
+        return status;
 
-        attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_IMAGE_NAME;
-        attr->Attributes[pos].Size         = nameW.Length;
-        attr->Attributes[pos].ValuePtr     = nameW.Buffer;
+    RtlNormalizeProcessParams( params );
+
+    attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_IMAGE_NAME;
+    attr->Attributes[pos].Size         = nameW.Length;
+    attr->Attributes[pos].ValuePtr     = nameW.Buffer;
+    attr->Attributes[pos].ReturnLength = NULL;
+    pos++;
+    attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_CLIENT_ID;
+    attr->Attributes[pos].Size         = sizeof(info->ClientId);
+    attr->Attributes[pos].ValuePtr     = &info->ClientId;
+    attr->Attributes[pos].ReturnLength = NULL;
+    pos++;
+    attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_IMAGE_INFO;
+    attr->Attributes[pos].Size         = sizeof(info->ImageInformation);
+    attr->Attributes[pos].ValuePtr     = &info->ImageInformation;
+    attr->Attributes[pos].ReturnLength = NULL;
+    pos++;
+    if (token)
+    {
+        attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_TOKEN;
+        attr->Attributes[pos].Size         = sizeof(token);
+        attr->Attributes[pos].ValuePtr     = token;
         attr->Attributes[pos].ReturnLength = NULL;
         pos++;
-        attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_CLIENT_ID;
-        attr->Attributes[pos].Size         = sizeof(info->ClientId);
-        attr->Attributes[pos].ValuePtr     = &info->ClientId;
+    }
+    if (debug)
+    {
+        attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_DEBUG_PORT;
+        attr->Attributes[pos].Size         = sizeof(debug);
+        attr->Attributes[pos].ValuePtr     = debug;
         attr->Attributes[pos].ReturnLength = NULL;
         pos++;
-        attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_IMAGE_INFO;
-        attr->Attributes[pos].Size         = sizeof(info->ImageInformation);
-        attr->Attributes[pos].ValuePtr     = &info->ImageInformation;
-        attr->Attributes[pos].ReturnLength = NULL;
-        pos++;
-        if (parent)
+    }
+
+    if (attrs) for (DWORD i = 0; i < attrs->count; ++i)
+    {
+        switch (attrs->attrs[i].attr)
         {
+        case PROC_THREAD_ATTRIBUTE_PARENT_PROCESS:
+        {
+            HANDLE parent = *(HANDLE *)attrs->attrs[i].value;
+            if (!parent)
+            {
+                status = STATUS_INVALID_HANDLE;
+                goto done;
+            }
             attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_PARENT_PROCESS;
             attr->Attributes[pos].Size         = sizeof(parent);
             attr->Attributes[pos].ValuePtr     = parent;
             attr->Attributes[pos].ReturnLength = NULL;
             pos++;
+            break;
         }
-        if ((process_flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES) && handle_list)
-        {
-            attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_HANDLE_LIST;
-            attr->Attributes[pos].Size         = handle_list->size;
-            attr->Attributes[pos].ValuePtr     = handle_list->value;
-            attr->Attributes[pos].ReturnLength = NULL;
-            pos++;
-        }
-        if (token)
-        {
-            attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_TOKEN;
-            attr->Attributes[pos].Size         = sizeof(token);
-            attr->Attributes[pos].ValuePtr     = token;
-            attr->Attributes[pos].ReturnLength = NULL;
-            pos++;
-        }
-        if (debug)
-        {
-            attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_DEBUG_PORT;
-            attr->Attributes[pos].Size         = sizeof(debug);
-            attr->Attributes[pos].ValuePtr     = debug;
-            attr->Attributes[pos].ReturnLength = NULL;
-            pos++;
-        }
-        if (job_list)
-        {
+        case PROC_THREAD_ATTRIBUTE_HANDLE_LIST:
+            if (process_flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES)
+            {
+                attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_HANDLE_LIST;
+                attr->Attributes[pos].Size         = attrs->attrs[i].size;
+                attr->Attributes[pos].ValuePtr     = attrs->attrs[i].value;
+                attr->Attributes[pos].ReturnLength = NULL;
+                pos++;
+            }
+            break;
+        case PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE:
+            break;
+        case PROC_THREAD_ATTRIBUTE_JOB_LIST:
             attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_JOB_LIST;
-            attr->Attributes[pos].Size         = job_list->size;
-            attr->Attributes[pos].ValuePtr     = job_list->value;
+            attr->Attributes[pos].Size         = attrs->attrs[i].size;
+            attr->Attributes[pos].ValuePtr     = attrs->attrs[i].value;
             attr->Attributes[pos].ReturnLength = NULL;
             pos++;
-        }
-        if (machine)
-        {
+            break;
+        case PROC_THREAD_ATTRIBUTE_MACHINE_TYPE:
             attr->Attributes[pos].Attribute    = PS_ATTRIBUTE_MACHINE_TYPE;
-            attr->Attributes[pos].Size         = sizeof(machine);
-            attr->Attributes[pos].Value        = machine;
+            attr->Attributes[pos].Size         = sizeof(USHORT);
+            attr->Attributes[pos].Value        = *(USHORT *)attrs->attrs[i].value;
             attr->Attributes[pos].ReturnLength = NULL;
             pos++;
+            break;
+        default:
+            FIXME("Unsupported attribute %#Ix.\n", attrs->attrs[i].attr);
+            break;
         }
-        attr->TotalLength = offsetof( PS_ATTRIBUTE_LIST, Attributes[pos] );
-
-        InitializeObjectAttributes( &process_attr, NULL, 0, NULL, psa ? psa->lpSecurityDescriptor : NULL );
-        InitializeObjectAttributes( &thread_attr, NULL, 0, NULL, tsa ? tsa->lpSecurityDescriptor : NULL );
-
-        status = NtCreateUserProcess( &info->Process, &info->Thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
-                                      &process_attr, &thread_attr, process_flags,
-                                      THREAD_CREATE_FLAGS_CREATE_SUSPENDED, params,
-                                      &create_info, attr );
-
-        RtlFreeUnicodeString( &nameW );
     }
+
+    attr->TotalLength = offsetof( PS_ATTRIBUTE_LIST, Attributes[pos] );
+
+    InitializeObjectAttributes( &process_attr, NULL, 0, NULL, psa ? psa->lpSecurityDescriptor : NULL );
+    InitializeObjectAttributes( &thread_attr, NULL, 0, NULL, tsa ? tsa->lpSecurityDescriptor : NULL );
+
+    status = NtCreateUserProcess( &info->Process, &info->Thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
+                                  &process_attr, &thread_attr, process_flags,
+                                  THREAD_CREATE_FLAGS_CREATE_SUSPENDED, params,
+                                  &create_info, attr );
+
+ done:
+    RtlFreeUnicodeString( &nameW );
     return status;
 }
 
@@ -380,7 +398,7 @@ static NTSTATUS create_vdm_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBU
               winevdm, params->ImagePathName.Buffer, params->CommandLine.Buffer );
     RtlInitUnicodeString( &params->ImagePathName, winevdm );
     RtlInitUnicodeString( &params->CommandLine, newcmdline );
-    status = create_nt_process( token, debug, psa, tsa, flags, params, info, 0, 0, NULL, NULL );
+    status = create_nt_process( token, debug, psa, tsa, flags, params, info, NULL );
     HeapFree( GetProcessHeap(), 0, newcmdline );
     return status;
 }
@@ -409,7 +427,7 @@ static NTSTATUS create_cmd_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBU
     swprintf( newcmdline, len, L"%s /s/c \"%s\"", comspec, params->CommandLine.Buffer );
     RtlInitUnicodeString( &params->ImagePathName, comspec );
     RtlInitUnicodeString( &params->CommandLine, newcmdline );
-    status = create_nt_process( token, debug, psa, tsa, flags, params, info, 0, 0, NULL, NULL );
+    status = create_nt_process( token, debug, psa, tsa, flags, params, info, NULL );
     RtlFreeHeap( GetProcessHeap(), 0, newcmdline );
     return status;
 }
@@ -512,14 +530,13 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                                                       const WCHAR *cur_dir, STARTUPINFOW *startup_info,
                                                       PROCESS_INFORMATION *info, HANDLE *new_token )
 {
-    const struct proc_thread_attr *handle_list = NULL, *job_list = NULL;
+    struct _PROC_THREAD_ATTRIBUTE_LIST *attrs = NULL;
     WCHAR name[MAX_PATH];
     WCHAR *p, *tidy_cmdline = cmd_line;
     RTL_USER_PROCESS_PARAMETERS *params = NULL;
     RTL_USER_PROCESS_INFORMATION rtl_info = { 0 };
-    HANDLE parent = 0, debug = 0;
+    HANDLE debug = 0;
     ULONG nt_flags = 0;
-    USHORT machine = 0;
     NTSTATUS status;
 
     /* Process the AppName and/or CmdLine to get module name and path */
@@ -575,66 +592,31 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     }
 
     if (flags & EXTENDED_STARTUPINFO_PRESENT)
-    {
-        struct _PROC_THREAD_ATTRIBUTE_LIST *attrs =
-                (struct _PROC_THREAD_ATTRIBUTE_LIST *)((STARTUPINFOEXW *)startup_info)->lpAttributeList;
-        unsigned int i;
+        attrs = (struct _PROC_THREAD_ATTRIBUTE_LIST *)((STARTUPINFOEXW *)startup_info)->lpAttributeList;
 
-        if (attrs)
+    if (attrs) for (unsigned int i = 0; i < attrs->count; ++i)
+    {
+        switch(attrs->attrs[i].attr)
         {
-            for (i = 0; i < attrs->count; ++i)
+        case PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE:
+        {
+            struct pseudo_console *console = attrs->attrs[i].value;
+            TRACE( "PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE %p reference %p\n",
+                   console, console->reference );
+            params->ConsoleHandle = console->reference;
+            if (!(flags & DETACHED_PROCESS))
             {
-                switch(attrs->attrs[i].attr)
+                params->ConsoleFlags |= 2;
+                /* don't inherit standard handles bound to parent console (but inherit the others) */
+                if (!(startup_info->dwFlags & STARTF_USESTDHANDLES))
                 {
-                    case PROC_THREAD_ATTRIBUTE_PARENT_PROCESS:
-                        parent = *(HANDLE *)attrs->attrs[i].value;
-                        TRACE("PROC_THREAD_ATTRIBUTE_PARENT_PROCESS parent %p.\n", parent);
-                        if (!parent)
-                        {
-                            status = STATUS_INVALID_HANDLE;
-                            goto done;
-                        }
-                        break;
-                    case PROC_THREAD_ATTRIBUTE_EXTENDED_FLAGS:
-                        FIXME("PROC_THREAD_ATTRIBUTE_EXTENDED_FLAGS %lx.\n", *(ULONG *)attrs->attrs[i].value);
-                        break;
-                    case PROC_THREAD_ATTRIBUTE_HANDLE_LIST:
-                        handle_list = &attrs->attrs[i];
-                        TRACE("PROC_THREAD_ATTRIBUTE_HANDLE_LIST handle count %Iu.\n", attrs->attrs[i].size / sizeof(HANDLE));
-                        break;
-                    case PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE:
-                        {
-                            struct pseudo_console *console = attrs->attrs[i].value;
-                            TRACE( "PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE %p reference %p\n",
-                                   console, console->reference );
-                            params->ConsoleHandle = console->reference;
-                            if (!(flags & DETACHED_PROCESS))
-                            {
-                                params->ConsoleFlags |= 2;
-                                /* don't inherit standard handles bound to parent console (but inherit the others) */
-                                if (!(startup_info->dwFlags & STARTF_USESTDHANDLES))
-                                {
-                                    if (is_console_handle(params->hStdInput))  params->hStdInput = NULL;
-                                    if (is_console_handle(params->hStdOutput)) params->hStdOutput = NULL;
-                                    if (is_console_handle(params->hStdError))  params->hStdError = NULL;
-                                }
-                            }
-                            break;
-                        }
-                    case PROC_THREAD_ATTRIBUTE_JOB_LIST:
-                        job_list = &attrs->attrs[i];
-                        TRACE( "PROC_THREAD_ATTRIBUTE_JOB_LIST handle count %Iu.\n",
-                               attrs->attrs[i].size / sizeof(HANDLE) );
-                        break;
-                    case PROC_THREAD_ATTRIBUTE_MACHINE_TYPE:
-                        machine = *(USHORT *)attrs->attrs[i].value;
-                        TRACE( "PROC_THREAD_ATTRIBUTE_MACHINE %x.\n", machine );
-                        break;
-                    default:
-                        FIXME("Unsupported attribute %#Ix.\n", attrs->attrs[i].attr);
-                        break;
+                    if (is_console_handle(params->hStdInput))  params->hStdInput = NULL;
+                    if (is_console_handle(params->hStdOutput)) params->hStdOutput = NULL;
+                    if (is_console_handle(params->hStdError))  params->hStdError = NULL;
                 }
             }
+            break;
+        }
         }
     }
 
@@ -644,7 +626,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     if (flags & CREATE_SUSPENDED) nt_flags |= PROCESS_CREATE_FLAGS_SUSPENDED;
 
     status = create_nt_process( token, debug, process_attr, thread_attr,
-                                nt_flags, params, &rtl_info, parent, machine, handle_list, job_list );
+                                nt_flags, params, &rtl_info, attrs );
     switch (status)
     {
     case STATUS_SUCCESS:
@@ -930,10 +912,36 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetProcessId( HANDLE process )
 /**********************************************************************
  *           GetProcessMitigationPolicy   (kernelbase.@)
  */
+/* iOS-Madeira: env.MADEIRA_ZERO_MITIGATION_POLICY=1 (only the exact value 1; unset, 0 or anything else changes nothing).
+ *
+ * The stub below answers TRUE and writes nothing, so a caller that trusts the answer reads whatever its stack held. ChakraCore's
+ * GlobalSecurityPolicy (a static constructor, run when ChakraCore.dll loads) does: it asks for ProcessControlFlowGuardPolicy into an
+ * uninitialised PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY, and when EnableControlFlowGuard (bit 0) happens to be set it looks up
+ * SetProcessValidCallTargets in api-ms-win-core-memory-l1-1-3.dll, which this Wine does not export, and calls
+ * RaiseFailFastException( NULL, NULL, FAIL_FAST_GENERATE_EXCEPTION_ADDRESS ): exit c0000602 within a second of the start.
+ * With the switch on the policy
+ * structure is zeroed: "no mitigation is enabled", which is what this Wine implements. Callers that never pass a buffer
+ * (NULL, or longer than any policy structure) are not touched. */
+static BOOL zero_mitigation_policy_enabled(void)
+{
+    static LONG enabled = -1;
+
+    if (enabled < 0)
+    {
+        WCHAR value[4];
+        DWORD err = GetLastError();
+        DWORD len = GetEnvironmentVariableW( L"MADEIRA_ZERO_MITIGATION_POLICY", value, ARRAY_SIZE(value) );
+        enabled = (len == 1 && value[0] == '1');
+        SetLastError( err );
+    }
+    return enabled;
+}
+
 BOOL WINAPI /* DECLSPEC_HOTPATCH */ GetProcessMitigationPolicy( HANDLE process, PROCESS_MITIGATION_POLICY policy,
                                                           void *buffer, SIZE_T length )
 {
     FIXME( "(%p, %u, %p, %Iu): stub\n", process, policy, buffer, length );
+    if (buffer && length && length <= 16 && zero_mitigation_policy_enabled()) memset( buffer, 0, length );
     return TRUE;
 }
 
@@ -1052,9 +1060,52 @@ BOOL WINAPI DECLSPEC_HOTPATCH IsProcessorFeaturePresent ( DWORD feature )
 /**********************************************************************
  *           IsWow64Process2   (kernelbase.@)
  */
+/* madeira [guest-machine-x64] (off by default; env MADEIRA_GUEST_MACHINE_X64 = 1
+ * turns it on for one program, as a line in that program's own config).
+ *
+ * It was on by default in 0.2.70.  Unreal's prerequisite check then looked for
+ * the x64 Visual C++ runtime key where Madeira writes the arm64 one, and
+ * Satisfactory stopped at an install prompt, so it is opt-in now.
+ *
+ * The host is ARM64, so the native machine reported here is ARM64.  A launcher
+ * built for x86 or x64 that reads it may then pick the ARM64 build of what it
+ * installs, and native ARM64 Windows code cannot rely on x18 on this host.
+ * A caller whose own main image is x86 or x64 is told the native machine is
+ * AMD64, which is what it would see on the PC it was built for.  ARM64 callers
+ * and ntdll's own RtlWow64GetProcessMachines get the real answer. */
+static BOOL guest_machine_x64(void)
+{
+    static LONG mode;   /* 0 not read, 1 off, 2 on */
+    LONG value = mode;
+
+    if (!value)
+    {
+        WCHAR buf[4];
+        DWORD err = GetLastError();   /* an unset variable must not leave ERROR_ENVVAR_NOT_FOUND behind */
+        DWORD len = GetEnvironmentVariableW( L"MADEIRA_GUEST_MACHINE_X64", buf, ARRAY_SIZE(buf) );
+        USHORT own = RtlImageNtHeader( NtCurrentTeb()->Peb->ImageBaseAddress )->FileHeader.Machine;
+
+        SetLastError( err );
+        value = 1;
+        if (len == 1 && buf[0] == '1' &&
+            (own == IMAGE_FILE_MACHINE_I386 || own == IMAGE_FILE_MACHINE_AMD64)) value = 2;
+        mode = value;
+    }
+    return value == 2;
+}
+
 BOOL WINAPI DECLSPEC_HOTPATCH IsWow64Process2( HANDLE process, USHORT *machine, USHORT *native_machine )
 {
-    return set_ntstatus( RtlWow64GetProcessMachines( process, machine, native_machine ));
+    static LONG logged;
+
+    if (!set_ntstatus( RtlWow64GetProcessMachines( process, machine, native_machine ))) return FALSE;
+    if (native_machine && *native_machine == IMAGE_FILE_MACHINE_ARM64 && guest_machine_x64())
+    {
+        *native_machine = IMAGE_FILE_MACHINE_AMD64;
+        if (!InterlockedExchange( &logged, 1 ))
+            ERR( "[guest-machine-x64] IsWow64Process2: native machine reported as AMD64 to this x86/x64 program\n" );
+    }
+    return TRUE;
 }
 
 

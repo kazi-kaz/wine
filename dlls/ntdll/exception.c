@@ -359,6 +359,24 @@ static BOOL unconverted_guest_ptr( ULONG_PTR val )
 static BOOL unconverted_guest_ptr( ULONG_PTR val ) { return FALSE; }
 #endif
 
+static const char *debugstr_addr( const void *addr )
+{
+    void *buffer[128];
+    MEMORY_SECTION_NAME *name = (MEMORY_SECTION_NAME *)buffer;
+    MEMORY_IMAGE_INFORMATION info;
+
+    if (!NtQueryVirtualMemory( GetCurrentProcess(), addr, MemoryImageInformation,
+                               &info, sizeof(info), NULL ) &&
+        !NtQueryVirtualMemory( GetCurrentProcess(), addr, MemoryMappedFilenameInformation,
+                               name, sizeof(buffer), NULL ))
+    {
+        WCHAR *p = wcsrchr( name->SectionFileName.Buffer, '\\' );
+        if (!p) p = name->SectionFileName.Buffer;
+        else p++;
+        return wine_dbg_sprintf( "%p (%ls+%08Ix)", addr, p, (char *)addr - (char *)info.ImageBase );
+    }
+    return wine_dbg_sprintf( "%p", addr );
+}
 
 /*******************************************************************
  *		dispatch_exception
@@ -375,13 +393,13 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         if (rec->ExceptionInformation[1] >> 16)
         {
             if (unconverted_guest_ptr( rec->ExceptionInformation[1] )) break;
-            MESSAGE( "wine: Call from %p to unimplemented function %s.%s, aborting\n",
-                     rec->ExceptionAddress,
+            MESSAGE( "wine: Call from %s to unimplemented function %s.%s, aborting\n",
+                     debugstr_addr( rec->ExceptionAddress ),
                      (char *)rec->ExceptionInformation[0], (char *)rec->ExceptionInformation[1] );
         }
         else
-            MESSAGE( "wine: Call from %p to unimplemented function %s.%u, aborting\n",
-                     rec->ExceptionAddress,
+            MESSAGE( "wine: Call from %s to unimplemented function %s.%u, aborting\n",
+                     debugstr_addr( rec->ExceptionAddress ),
                      (char *)rec->ExceptionInformation[0], (USHORT)rec->ExceptionInformation[1] );
         break;
 
@@ -420,9 +438,9 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         break;
     }
 
-    TRACE( "code=%lx (%s) flags=%lx addr=%p\n",
+    TRACE( "code=%lx (%s) flags=%lx addr=%s\n",
            rec->ExceptionCode, debugstr_exception_code(rec->ExceptionCode),
-           rec->ExceptionFlags, rec->ExceptionAddress );
+           rec->ExceptionFlags, debugstr_addr( rec->ExceptionAddress ));
     for (i = 0; i < min( EXCEPTION_MAXIMUM_PARAMETERS, rec->NumberParameters ); i++)
         TRACE( " info[%ld]=%p\n", i, (void *)rec->ExceptionInformation[i] );
     TRACE_CONTEXT( context );
@@ -762,14 +780,6 @@ void WINAPI RtlGetCallersAddress( void **caller, void **parent )
     *parent = count > 1 ? buffer[1] : NULL;
 }
 
-
-/**********************************************************************
- *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
- */
-ULONG64 WINAPI RtlGetEnabledExtendedFeatures(ULONG64 feature_mask)
-{
-    return user_shared_data->XState.EnabledFeatures & feature_mask;
-}
 
 struct context_copy_range
 {

@@ -2353,6 +2353,12 @@ PROC WINAPI wglGetProcAddress( LPCSTR name )
         LeaveCriticalSection( &wgl_cs );
     }
 
+    /* Madeira: OpenGL ES versions do not map onto the desktop version gates
+     * (ES 3.0 has functions from desktop 3.0 through 4.3), so every known
+     * function is handed out on an ES context. One the driver lacks then fails
+     * with a warning when called instead of being NULL here. */
+    if (!strncmp( ctx->base.version_str, "OpenGL ES", 9 )) return func->func;
+
     if (func->major && ctx->base.attrs.major > func->major) return func->func;
     if (func->major && ctx->base.attrs.major == func->major && ctx->base.attrs.minor >= func->minor) return func->func;
 
@@ -3142,14 +3148,57 @@ const GLubyte * WINAPI glGetStringi( GLenum name, GLuint index )
     return args.ret;
 }
 
+/* Madeira: byte limit of the GL_EXTENSIONS string, 0 for none. 32-bit programs
+ * get 3072 unless MADEIRA_GL_EXTENSIONS_MAX says otherwise (0 = no limit). */
+static size_t max_extensions_length(void)
+{
+    char env[16];
+    DWORD len = GetEnvironmentVariableA( "MADEIRA_GL_EXTENSIONS_MAX", env, sizeof(env) );
+
+    if (len && len < sizeof(env)) return strtoul( env, NULL, 10 );
+    return sizeof(void *) == 4 ? 3072 : 0;
+}
+
 /* build the extension string by filtering out the disabled extensions */
 static GLubyte *filter_extensions( struct opengl_client_context *client, const GLubyte *str )
 {
-    enum opengl_extension extensions[GL_EXTENSION_COUNT];
-    size_t count, i, size = 1;
+    enum opengl_extension extensions[GL_EXTENSION_COUNT + 4];
+    size_t count, i, size = 1, max_len = max_extensions_length(), reserve = 1, used = 0;
+    BOOL has_es2 = FALSE, has_es3 = FALSE;
     char *ret, *ptr;
 
     if (!(count = parse_extensions( (const char *)str, extensions ))) return NULL;
+
+    /* Madeira: id Tech 2/3 era games print or copy GL_EXTENSIONS into a fixed
+     * stack buffer (Jedi Academy: Com_Printf's 4 KB), and Zink's list is ~9 KB,
+     * so the copy overwrote the return address. Mesa lists extensions oldest
+     * first for exactly these games, so a 32-bit process gets the list cut at
+     * the last whole extension that fits. glGetStringi is unaffected. */
+    if (client->extensions[WGL_EXT_extensions_string]) reserve += all_extensions[WGL_EXT_extensions_string].len + 1;
+    if (client->extensions[WGL_EXT_swap_control]) reserve += all_extensions[WGL_EXT_swap_control].len + 1;
+    for (i = 0; i < count; i++)
+    {
+        if (!max_len || !client->extensions[extensions[i]]) continue;
+        if (used + all_extensions[extensions[i]].len + 1 + reserve > max_len)
+        {
+            ERR( "[winios-gl] GL_EXTENSIONS cut at %u bytes before %s (MADEIRA_GL_EXTENSIONS_MAX)\n",
+                 (unsigned int)used, all_extensions[extensions[i]].name );
+            count = i;
+            break;
+        }
+        used += all_extensions[extensions[i]].len + 1;
+    }
+    /* only what survived the cut counts as present */
+    for (i = 0; i < count; i++)
+    {
+        if (extensions[i] == GL_ARB_ES2_compatibility) has_es2 = TRUE;
+        if (extensions[i] == GL_ARB_ES3_compatibility) has_es3 = TRUE;
+    }
+    /* Madeira: the unix side flags these two for an OpenGL ES host context,
+     * whose own extension string does not carry them. */
+    if (!has_es2 && client->extensions[GL_ARB_ES2_compatibility]) extensions[count++] = GL_ARB_ES2_compatibility;
+    if (!has_es3 && client->extensions[GL_ARB_ES3_compatibility]) extensions[count++] = GL_ARB_ES3_compatibility;
+
     if (client->extensions[WGL_EXT_extensions_string]) extensions[count++] = WGL_EXT_extensions_string;
     if (client->extensions[WGL_EXT_swap_control]) extensions[count++] = WGL_EXT_swap_control;
 
@@ -3312,6 +3361,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
         UNIX_CALL( process_detach, NULL );
         /* fallthrough */
     case DLL_THREAD_DETACH:
+        UNIX_CALL( thread_detach, NtCurrentTeb() );
         if ((context = get_current_context())) context->base.current_tid = 0;
         free( NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_FORMATS_PTR] );
         return TRUE;

@@ -509,7 +509,7 @@ static void createstruct_32to64( const CREATESTRUCT32 *from, CREATESTRUCTW *to )
     to->style          = from->style;
     to->dwExStyle      = from->dwExStyle;
     to->lpszName       = guest_ptr32( from->lpszName );
-    to->lpszClass      = guest_ptr32( from->lpszClass );
+    to->lpszClass      = guest_ptr_or_intres32( from->lpszClass );   /* iOS-Madeira: an atom stays an atom */
 }
 
 static void createstruct_64to32( const CREATESTRUCTW *from, CREATESTRUCT32 *to )
@@ -526,7 +526,7 @@ static void createstruct_64to32( const CREATESTRUCTW *from, CREATESTRUCT32 *to )
     cs.x              = from->x;
     cs.style          = from->style;
     cs.lpszName       = host_ptr32( from->lpszName );
-    cs.lpszClass      = host_ptr32( from->lpszClass );
+    cs.lpszClass      = host_ptr_or_intres32( from->lpszClass );   /* iOS-Madeira: an atom stays an atom */
     cs.dwExStyle      = from->dwExStyle;
     memcpy( to, &cs, sizeof(cs) );
 }
@@ -2086,7 +2086,7 @@ NTSTATUS WINAPI wow64_NtUserCreateWindowEx( UINT *args )
     void *params = get_ptr( &args );
     DWORD flags = get_ulong( &args );
     HINSTANCE client_instance = get_ptr( &args );
-    const WCHAR *class = get_str_or_atom( &args );
+    const WCHAR *class = get_str_or_atom( &args );   /* iOS-Madeira: a MAKEINTATOM class is an atom, not a pointer */
     BOOL ansi = get_ulong( &args );
 
     UNICODE_STRING class_name, version, window_name;
@@ -3273,7 +3273,7 @@ NTSTATUS WINAPI wow64_NtUserGetRawInputDeviceList( UINT *args )
         ret = NtUserGetRawInputDeviceList( devices64, count, sizeof(RAWINPUTDEVICELIST) );
         if (ret == ~0u) return ret;
 
-        for (i = 0; i < *count; ++i)
+        for (i = 0; i < ret; ++i)
         {
             devices32[i].hDevice = (UINT_PTR)devices64[i].hDevice;
             devices32[i].dwType  = devices64[i].dwType;
@@ -4636,13 +4636,6 @@ NTSTATUS WINAPI wow64_NtUserSetClassLongPtr( UINT *args )
     INT offset = get_ulong( &args );
     LONG_PTR newval = get_ulong( &args );
     BOOL ansi = get_ulong( &args );
-
-    if (offset == GCLP_MENUNAME)
-    {
-        ULONG_PTR value = IS_INTRESOURCE(newval) ? newval : (ULONG_PTR)guest_ptr32( newval );
-        ULONG_PTR ret = NtUserSetClassLongPtr( hwnd, offset, value, ansi );
-        return IS_INTRESOURCE(ret) ? ret : host_ptr32( (void *)ret );
-    }
 
     return NtUserSetClassLongPtr( hwnd, offset, newval, ansi );
 }

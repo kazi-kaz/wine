@@ -5680,6 +5680,55 @@ static int intrinsic_function_name_compare(const void *a, const void *b)
     return strcmp(a, func->name);
 }
 
+/* Madeira [hlsl-no-compatible] (Crusader Kings II: "No compatible 2 parameter declaration for
+ * GetFoWColor found"; the report has no shader text): log the call's argument types and every
+ * declared overload's parameter types, once per function name, at most 32 names per process.
+ * Diagnostic only; the compile still fails as before. */
+static void log_no_compatible_call(struct hlsl_ctx *ctx, const char *name,
+        const struct parse_initializer *args, const struct vkd3d_shader_location *loc)
+{
+    static char logged_names[32][64];
+    static unsigned int logged_count;
+    const struct hlsl_ir_function_decl *decl;
+    struct vkd3d_string_buffer *string;
+    const struct hlsl_ir_function *func;
+    struct rb_entry *entry;
+    unsigned int i, n = 0;
+
+    for (i = 0; i < logged_count; ++i)
+        if (!strncmp(logged_names[i], name, sizeof(logged_names[i]) - 1))
+            return;
+    if (logged_count >= ARRAY_SIZE(logged_names))
+        return;
+    snprintf(logged_names[logged_count++], sizeof(logged_names[0]), "%s", name);
+
+    ERR("[hlsl-no-compatible] call %s(%u args) at %s:%u:%u\n", name, args->args_count,
+            loc->source_name ? loc->source_name : "?", loc->line, loc->column);
+    for (i = 0; i < args->args_count; ++i)
+    {
+        string = hlsl_type_to_string(ctx, args->args[i]->data_type);
+        ERR("[hlsl-no-compatible]   arg %u: %s\n", i + 1, string ? string->buffer : "?");
+        hlsl_release_string_buffer(ctx, string);
+    }
+    if (!(entry = rb_get(&ctx->functions, name)))
+        return;
+    func = RB_ENTRY_VALUE(entry, struct hlsl_ir_function, entry);
+    LIST_FOR_EACH_ENTRY(decl, &func->overloads, struct hlsl_ir_function_decl, entry)
+    {
+        ERR("[hlsl-no-compatible]   overload %u (%zu params) declared at %s:%u:%u\n", ++n, decl->parameters.count,
+                decl->loc.source_name ? decl->loc.source_name : "?", decl->loc.line, decl->loc.column);
+        for (i = 0; i < decl->parameters.count; ++i)
+        {
+            const struct hlsl_ir_var *var = decl->parameters.vars[i];
+
+            string = hlsl_type_to_string(ctx, var->data_type);
+            ERR("[hlsl-no-compatible]     param %u: %s %s\n", i + 1, string ? string->buffer : "?",
+                    var->name ? var->name : "");
+            hlsl_release_string_buffer(ctx, string);
+        }
+    }
+}
+
 static struct hlsl_block *add_call(struct hlsl_ctx *ctx, const char *name,
         struct parse_initializer *args, const struct vkd3d_shader_location *loc)
 {
@@ -5733,6 +5782,7 @@ static struct hlsl_block *add_call(struct hlsl_ctx *ctx, const char *name,
     }
     else if (rb_get(&ctx->functions, name))
     {
+        log_no_compatible_call(ctx, name, args, loc);   /* Madeira [hlsl-no-compatible] */
         hlsl_error(ctx, loc, VKD3D_SHADER_ERROR_HLSL_NOT_DEFINED, "No compatible %u parameter declaration for \"%s\" found.",
                 args->args_count, name);
         goto fail;

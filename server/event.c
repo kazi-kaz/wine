@@ -292,9 +292,13 @@ static const struct object_ops event_sync_ops =
     .type         = &no_type,
     .dump         = event_sync_dump,
 #ifdef WINE_IOS
+    /* ml952 fastsync: the add/remove hooks maintain cell->srv_waiters, which
+     * is the flag a client setter reads to decide whether the server still has
+     * to be told about a set.  The increment MUST be visible before the server
+     * evaluates `signaled', and it is: wait_on() adds every queue entry and
+     * only then does check_wait() call signaled. */
     .add_queue    = event_sync_add_queue,
     .remove_queue = event_sync_remove_queue,
-    .destroy      = event_sync_destroy,
 #else
     .add_queue    = add_queue,
     .remove_queue = remove_queue,
@@ -302,6 +306,9 @@ static const struct object_ops event_sync_ops =
     .signaled     = event_sync_signaled,
     .satisfied    = event_sync_satisfied,
     .signal       = event_sync_signal,
+#ifdef WINE_IOS
+    .destroy      = event_sync_destroy,
+#endif
 };
 
 static struct object *create_event_sync( int manual, int signaled )
@@ -842,8 +849,25 @@ static bool event_init( struct object *obj, const void *init_data )
     const struct event_init_data *data = init_data;
 
     list_init( &event->kernel_object );
+    /* ml809: MUST zero the stats block here.
+     *
+     * alloc_object() uses mem_alloc(), not calloc, and initialises only
+     * the struct object header -- everything a subclass adds is garbage
+     * until it assigns it. ml807/ml808 left this block uninitialised, so
+     * ring_pos started as a random value and the first recorded
+     * operation wrote ring[garbage], off the end of the object and into
+     * the server heap. The wineserver then stopped answering and every
+     * client blocked forever in wine_server_call, the first being
+     * NtCreateEvent in unix_init_startup_info -- i.e. the desktop never
+     * came up, which looked nothing like an event-probe bug. */
     memset( &event->ios, 0, sizeof(event->ios) );
-    return !!(event->sync = create_event_sync( data->manual_reset, data->initial_state ));
+    if (!(event->sync = create_event_sync( data->manual_reset, data->initial_state ))) return false;
+    /* ml805: record identity at birth, so a later [evt-hist] dump can say
+     * whether the object a stuck waiter is queued on was ever touched.
+     * (Wine 11.22: creation moved into the init() operation, so this is
+     * recorded here instead of in DECL_HANDLER(create_event).) */
+    ios_evt_record( event, event->sync, IOS_EVT_CREATE, data->initial_state );
+    return true;
 }
 
 static struct object *event_get_sync( struct object *obj )
@@ -976,17 +1000,6 @@ DECL_HANDLER(create_event)
 
     if (!get_req_object_attributes( &params )) return;
     reply->handle = create_named_obj_handle( current->process, &params );
-    if (reply->handle)
-    {
-        unsigned int status = get_error();
-        struct event *event = (struct event *)get_handle_obj( current->process, reply->handle, 0, &event_ops );
-        if (event)
-        {
-            ios_evt_record( event, event->sync, IOS_EVT_CREATE, req->initial_state );
-            release_object( event );
-        }
-        set_error( status );
-    }
     if (params.root) release_object( params.root );
 }
 

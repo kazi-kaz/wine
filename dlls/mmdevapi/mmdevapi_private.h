@@ -74,6 +74,7 @@ struct audio_client {
     float *vols;
     UINT32 channel_count;
     stream_handle stream;
+    HANDLE timer_thread; /* Madeira: see MADEIRA_S_PE_TIMER in unixlib.h */
 
     struct audio_session *session;
     struct audio_session_wrapper *session_wrapper;

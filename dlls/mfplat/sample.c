@@ -1330,6 +1330,28 @@ static void sample_allocator_release_surface_service(struct sample_allocator *al
         IMFDXGIDeviceManager_CloseDeviceHandle(allocator->dxgi_device_manager, service->hdevice);
 }
 
+/* iOS-Madeira mf-sysmem-fallback: Resident Evil Village (0.2.54) hands the
+ * source reader a D3D11 device; the reader's allocator then makes NV12
+ * textures, which DXMT cannot create ("CreateMTLTextureDescriptorInternal:
+ * creating a texture of invalid format: 103"), so SetCurrentMediaType fails
+ * and every video stays blank.  When the texture cannot be made, use a
+ * system-memory 2D buffer of the same format instead, and log it (first 8).
+ * A caller that needs the texture (IMFDXGIBuffer) is logged in buffer.c.
+ * env MADEIRA_MF_SYSMEM_FALLBACK=0 restores the failure. */
+LONG madeira_mf_sysmem_fallbacks;
+
+static BOOL madeira_mf_sysmem_fallback_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        char v[8];
+        DWORD len = GetEnvironmentVariableA("MADEIRA_MF_SYSMEM_FALLBACK", v, sizeof(v));
+        on = !(len == 1 && v[0] == '0');
+    }
+    return on;
+}
+
 static HRESULT sample_allocator_allocate_sample(struct sample_allocator *allocator, const struct surface_service *service,
         struct queued_sample **queued_sample)
 {
@@ -1383,6 +1405,23 @@ static HRESULT sample_allocator_allocate_sample(struct sample_allocator *allocat
             {
                 hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)texture, 0, FALSE, &buffer);
                 ID3D11Texture2D_Release(texture);
+            }
+            /* only the video formats DXMT has no texture for, and not a memory
+             * or device error, so the pool never mixes textures and buffers */
+            else if (madeira_mf_sysmem_fallback_on()
+                    && (desc.Format == DXGI_FORMAT_NV12 || desc.Format == DXGI_FORMAT_P010
+                        || desc.Format == DXGI_FORMAT_YUY2)
+                    && hr != E_OUTOFMEMORY && hr != DXGI_ERROR_DEVICE_REMOVED)
+            {
+                HRESULT texture_hr = hr;
+
+                hr = MFCreate2DMediaBuffer(allocator->frame_desc.width, allocator->frame_desc.height,
+                        allocator->frame_desc.d3d9_format, FALSE, &buffer);
+                if (InterlockedIncrement(&madeira_mf_sysmem_fallbacks) <= 8)
+                    ERR("[mf-sysmem] D3D11 texture %ux%u dxgi format %u usage %u bind %#x misc %#x failed hr %#lx; "
+                            "system-memory buffer instead -> hr %#lx (MADEIRA_MF_SYSMEM_FALLBACK=0 turns this off)\n",
+                            desc.Width, desc.Height, desc.Format, desc.Usage, desc.BindFlags, desc.MiscFlags,
+                            texture_hr, hr);
             }
         }
         else

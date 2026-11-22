@@ -333,11 +333,51 @@ struct sock
     unsigned int        reset : 1;   /* did we get a TCP reset? */
     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
+#ifdef WINE_IOS
+    struct timeout_user *connect_timeout; /* madeira: MADEIRA_CONNECT_TIMEOUT_MS timer */
+    timeout_t           connect_start;    /* madeira: when the pending connect began */
+#endif
 };
 
 static int is_tcp_socket( struct sock *sock )
 {
     return sock->type == WS_SOCK_STREAM && (sock->family == WS_AF_INET || sock->family == WS_AF_INET6);
+}
+
+/* madeira [tcp-rcvbuf-keep] (env MADEIRA_TCP_RCVBUF_KEEP = 0 turns it off).
+ *
+ * On Windows SO_RCVBUF sizes the application's buffer and the TCP receive
+ * window still scales by itself.  On Darwin a setsockopt(SO_RCVBUF) on a TCP
+ * socket pins the socket buffer at that size and stops the kernel growing it,
+ * so a downloader that asks for a small buffer is held to a few MB/s on a fast
+ * line.  For a TCP (stream, IPv4/IPv6) socket the request is therefore only
+ * remembered and reported back by SO_RCVBUF queries; the system buffer is not
+ * touched.  Datagram and other sockets are set as before, and so is the
+ * minimum applied when a socket is created.  Returns 1 when the request was
+ * kept back. */
+static int madeira_tcp_rcvbuf_keep( struct sock *sock, unsigned int asked )
+{
+#ifdef __APPLE__
+    static int mode = -1;   /* -1 not read, 0 off, 1 on */
+    static unsigned int logged;
+
+    if (mode < 0)
+    {
+        const char *e = getenv( "MADEIRA_TCP_RCVBUF_KEEP" );
+        mode = !(e && e[0] == '0' && !e[1]);
+    }
+    if (!mode) return 0;
+    if (!is_tcp_socket( sock )) return 0;
+    if (logged < 8)
+    {
+        logged++;
+        fprintf( stderr, "[tcp-rcvbuf-keep] a program asked SO_RCVBUF=%u on a TCP socket: remembered, "
+                 "system buffer left to grow (MADEIRA_TCP_RCVBUF_KEEP=0 sets it as before)\n", asked );
+    }
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 static int addr_compare( const void *key, const struct wine_rb_entry *entry )
@@ -512,6 +552,75 @@ static unsigned int sock_get_error( int err );
 static void poll_socket( struct sock *poll_sock, struct async *async, int exclusive, timeout_t timeout,
                          unsigned int count, const struct afd_poll_socket_64 *sockets );
 
+#ifdef WINE_IOS
+/* madeira: a bound on how long a TCP connect may stay pending.
+ *
+ * Darwin gives up on a peer that never answers the SYN after about 75 s and
+ * Windows after about 21 s; a Windows program that waits for the answer with a
+ * timeout of its own waits that long either way. Valve's client checks the
+ * connection to test.steampowered.com before it logs on and waits 60 s for an
+ * address that does not answer (a device log, 2026-11-15: 218.38.137.28:80,
+ * logon 61 s instead of 1 s). MADEIRA_CONNECT_TIMEOUT_MS = N (1000-120000)
+ * fails a connect still pending after N ms the way a refused SYN fails it:
+ * select reports the connect error, SO_ERROR and ConnectEx give
+ * WSAETIMEDOUT. Unset or 0: no bound, as before. Read once, when the first
+ * connect starts. The app sets it for Madeira Dock sessions. */
+static int madeira_connect_timeout_ms( void )
+{
+    static int ms = -1;
+
+    if (ms < 0)
+    {
+        const char *e = getenv( "MADEIRA_CONNECT_TIMEOUT_MS" );
+        long v = e ? strtol( e, NULL, 10 ) : 0;
+        ms = (v >= 1000 && v <= 120000) ? (int)v : 0;
+        if (ms) fprintf( stderr, "[srv-conn-timeout] a TCP connect pending %d ms fails with WSAETIMEDOUT (MADEIRA_CONNECT_TIMEOUT_MS)\n", ms );
+    }
+    return ms;
+}
+
+static void madeira_connect_timeout_cancel( struct sock *sock )
+{
+    if (!sock->connect_timeout) return;
+    remove_timeout_user( sock->connect_timeout );
+    sock->connect_timeout = NULL;
+}
+
+static void madeira_connect_timed_out( void *private )
+{
+    static int logged;
+    struct sock *sock = private;
+    unsigned short dport = 0;
+
+    sock->connect_timeout = NULL;
+    if (sock->state != SOCK_CONNECTING || !sock->fd) return;
+
+    if (sock->peer_addr.addr.sa_family == WS_AF_INET) dport = ntohs( sock->peer_addr.in.sin_port );
+    else if (sock->peer_addr.addr.sa_family == WS_AF_INET6) dport = ntohs( sock->peer_addr.in6.sin6_port );
+    if (logged < 32)
+    {
+        logged++;
+        fprintf( stderr, "[srv-conn-timeout] dport=%u still connecting after %ld ms: WSAETIMEDOUT to the program\n",
+                 dport, (long)((current_time - sock->connect_start) / 10000) );
+    }
+
+    /* sock_error() finds no SO_ERROR on a socket still connecting and takes
+     * this one, so the event below is the kernel's own failure path. */
+    sock->errors[AFD_POLL_BIT_CONNECT_ERR] = ETIMEDOUT;
+    sock_poll_event( sock->fd, POLLERR );
+}
+
+static void madeira_connect_timeout_start( struct sock *sock )
+{
+    int ms = madeira_connect_timeout_ms();
+
+    madeira_connect_timeout_cancel( sock );
+    if (!ms) return;
+    sock->connect_start = current_time;
+    sock->connect_timeout = add_timeout_user( -(timeout_t)ms * 10000, madeira_connect_timed_out, sock );
+}
+#endif
+
 static const struct object_ops sock_ops =
 {
     .size         = sizeof(struct sock),
@@ -529,6 +638,7 @@ static const struct fd_ops sock_fd_ops =
     .poll_event      = sock_poll_event,
     .get_fd_type     = sock_get_fd_type,
     .get_file_info   = default_fd_get_file_info,
+    .set_file_info   = default_fd_set_file_info,
     .ioctl           = sock_ioctl,
     .cancel_async    = sock_cancel_async,
     .reselect_async  = sock_reselect_async,
@@ -1505,6 +1615,9 @@ static void sock_poll_event( struct fd *fd, int event )
             sock->connect_time = current_time;
             sock->errors[AFD_POLL_BIT_CONNECT_ERR] = 0;
         }
+#ifdef WINE_IOS
+        if (sock->state != SOCK_CONNECTING) madeira_connect_timeout_cancel( sock );
+#endif
         break;
 
     case SOCK_LISTENING:
@@ -1832,6 +1945,10 @@ static void sock_destroy( struct object *obj )
 
     assert( obj->ops == &sock_ops );
 
+#ifdef WINE_IOS
+    madeira_connect_timeout_cancel( sock );
+#endif
+
     /* FIXME: special socket shutdown stuff? */
 
     for (i = 0; i < 2; ++i)
@@ -1880,6 +1997,10 @@ static struct sock *create_socket(void)
     sock->ifchange_obj = NULL;
     sock->accept_recv_req = NULL;
     sock->connect_req = NULL;
+#ifdef WINE_IOS
+    sock->connect_timeout = NULL;
+    sock->connect_start = 0;
+#endif
     sock->main_poll = NULL;
     memset( &sock->addr, 0, sizeof(sock->addr) );
     sock->addr_len = 0;
@@ -2926,6 +3047,10 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         if (sock->type != WS_SOCK_DGRAM)
             sock->state = SOCK_CONNECTING;
+#ifdef WINE_IOS
+        if (sock->state == SOCK_CONNECTING && is_tcp_socket( sock ))
+            madeira_connect_timeout_start( sock );
+#endif
 
         if (params->synchronous && sock->nonblocking)
         {
@@ -3429,6 +3554,12 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         }
         rcvbuf = *(DWORD *)get_req_data();
         set_rcvbuf = max( rcvbuf, MIN_RCVBUF );
+
+        if (madeira_tcp_rcvbuf_keep( sock, rcvbuf ))
+        {
+            sock->rcvbuf = rcvbuf;
+            return;
+        }
 
         if (!setsockopt( unix_fd, SOL_SOCKET, SO_RCVBUF, (char *)&set_rcvbuf, sizeof(set_rcvbuf) ))
             sock->rcvbuf = rcvbuf;

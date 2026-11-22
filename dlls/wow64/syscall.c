@@ -1342,6 +1342,13 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     GET_PTR( BTCpuNotifyMemoryDirty );
     GET_PTR( BTCpuNotifyMemoryFree );
     GET_PTR( BTCpuNotifyMemoryProtect );
+    /* MADEIRA: the CPU backend's DEP hook.  Upstream never resolved or called it, so
+     * NtSetInformationProcess(ProcessExecuteFlags) - which the 32-bit loader issues for every
+     * image without IMAGE_DLLCHARACTERISTICS_NX_COMPAT (dlls/ntdll/loader.c:1930), and which
+     * SetProcessDEPPolicy issues at runtime - reached the host ntdll and stopped there.  The
+     * emulator therefore never learned that DEP is off and kept refusing to translate code the
+     * program had written into its own PAGE_READWRITE memory.  Optional like every other hook:
+     * a backend that does not export it is simply not told. */
     GET_PTR( BTCpuNotifyProcessExecuteFlagsChange );
     GET_PTR( BTCpuNotifyReadFile );
     GET_PTR( BTCpuNotifyUnmapViewOfSection );

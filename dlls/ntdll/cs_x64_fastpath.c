@@ -330,14 +330,16 @@ static void madeira_x64_fastpath_install(void)
     {
         BOOL ok = x64_fp_redirect( tls_ffs, page + 0x180 );
         void *k32_thunk_target = NULL;
-        BYTE *k32;
+        BYTE *k32 = NULL;
 
         /* kernel32's TlsGetValue is an x64 `jmp [rip+x]` through its import of kernelbase's; it only
          * reaches the stub if that slot holds kernelbase's x64 entry. Report which. */
         RtlInitUnicodeString( &us, L"kernel32.dll" );
         LdrGetDllHandle( NULL, 0, &us, &kernel32 );
         if (kernel32 && (k32 = RtlFindExportedRoutineByName( kernel32, "TlsGetValue" )) &&
-            k32[0] == 0xff && k32[1] == 0x25)
+            k32[0] == 0x48 && k32[1] == 0x8d && k32[2] == 0xa4 && k32[3] == 0x24 && k32[8] == 0xff)
+            k32 += 8;  /* [arm64x-hotpatch-thunks] hotpatch prologue */
+        if (k32 && k32[0] == 0xff && k32[1] == 0x25)
         {
             LONG rel;
             memcpy( &rel, k32 + 2, sizeof(rel) );

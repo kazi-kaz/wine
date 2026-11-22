@@ -192,6 +192,21 @@ static void dump_fmt(const WAVEFORMATEX *fmt)
     }
 }
 
+/* Madeira: the timer thread of a driver that asked for one (unixlib.h) */
+static DWORD CALLBACK madeira_timer_loop_func(void *user)
+{
+    struct madeira_timer_loop_params params;
+    struct audio_client *This = user;
+
+    SetThreadDescription(GetCurrentThread(), L"audio_client_timer");
+
+    params.stream = This->stream;
+
+    wine_unix_call(MADEIRA_UNIX_TIMER_LOOP, &params);
+
+    return 0;
+}
+
 static HRESULT stream_release(stream_handle stream)
 {
     struct release_stream_params params;
@@ -707,6 +722,12 @@ static ULONG WINAPI client_Release(IAudioClient3 *iface)
         if (This->stream)
             stream_release(This->stream);
 
+        /* Madeira: the driver's release made the timer loop return */
+        if (This->timer_thread) {
+            WaitForSingleObject(This->timer_thread, INFINITE);
+            CloseHandle(This->timer_thread);
+        }
+
         free(This->device_name);
         free(This);
     }
@@ -918,6 +939,19 @@ static HRESULT WINAPI client_Start(IAudioClient3 *iface)
 
     params.stream = This->stream;
     wine_unix_call(start, &params);
+
+    if (params.result == MADEIRA_S_PE_TIMER) {
+        params.result = S_OK;
+        if (!This->timer_thread) {
+            if ((This->timer_thread = CreateThread(NULL, 0, madeira_timer_loop_func, This, 0, NULL)))
+                SetThreadPriority(This->timer_thread, THREAD_PRIORITY_TIME_CRITICAL);
+            else {
+                sessions_unlock();
+                IAudioClient3_Stop(&This->IAudioClient3_iface);
+                return E_FAIL;
+            }
+        }
+    }
 
     sessions_unlock();
 

@@ -472,6 +472,40 @@ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceFrequency( LARGE_INTEGER *frequ
     return TRUE;
 }
 
+/* Madeira: KUSER_SHARED_DATA cannot be mapped at 0x7ffe0000 on iOS, so every read of it
+ * from a 64-bit program is a fault that the unix side answers (thousands a second in a game
+ * that polls the clock). kernelbase already derives GetTickCount, GetTickCount64 and
+ * QueryInterruptTime from NtQueryPerformanceCounter (10 MHz, the same clock the server
+ * publishes); NtGetTickCount and RtlQueryUnbiasedInterruptTime did the page read themselves.
+ * Same derivation here. env MADEIRA_USD_DIRECT=0 keeps the page read. */
+static BOOL madeira_usd_direct(void)
+{
+    static LONG state;   /* 0 unknown, 1 on, 2 off */
+    LONG s = ReadNoFence( &state );
+
+    if (!s)
+    {
+        UNICODE_STRING name = RTL_CONSTANT_STRING( L"MADEIRA_USD_DIRECT" );
+        WCHAR buf[4];
+        UNICODE_STRING value = { 0, sizeof(buf), buf };
+
+        s = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length == sizeof(WCHAR) && buf[0] == '0') ? 2 : 1;
+        InterlockedExchange( &state, s );
+    }
+    return s == 1;
+}
+
+static ULONGLONG madeira_interrupt_time(void)
+{
+    LARGE_INTEGER counter, freq;
+
+    NtQueryPerformanceCounter( &counter, &freq );
+    if (freq.QuadPart == 10000000 || !freq.QuadPart) return counter.QuadPart;
+    return counter.QuadPart / freq.QuadPart * 10000000 +
+           counter.QuadPart % freq.QuadPart * 10000000 / freq.QuadPart;
+}
+
+
 /******************************************************************************
  * NtGetTickCount   (NTDLL.@)
  * ZwGetTickCount   (NTDLL.@)
@@ -479,6 +513,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceFrequency( LARGE_INTEGER *frequ
 ULONG WINAPI DECLSPEC_HOTPATCH NtGetTickCount(void)
 {
     /* note: we ignore TickCountMultiplier */
+    if (madeira_usd_direct()) return (ULONG)(madeira_interrupt_time() / 10000);
     return user_shared_data->TickCount.LowPart;
 }
 
@@ -545,6 +580,12 @@ BOOL WINAPI RtlQueryUnbiasedInterruptTime(ULONGLONG *time)
     {
         RtlSetLastWin32ErrorAndNtStatusFromNtStatus( STATUS_INVALID_PARAMETER );
         return FALSE;
+    }
+
+    if (madeira_usd_direct())
+    {
+        *time = madeira_interrupt_time();
+        return TRUE;
     }
 
     do

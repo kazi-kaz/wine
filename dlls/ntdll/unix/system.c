@@ -306,6 +306,7 @@ enum smbios_type
 #define RSMB 0x52534D42
 
 ULONG cpu_count = 1;
+ULONG madeira_peb_cpu_count = 0;  /* ml1122: 0 = report cpu_count */
 
 static char cpu_name[49];
 static char cpu_vendor[13];
@@ -762,7 +763,7 @@ static ULONGLONG get_cpu_features(void)
 
 void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
 {
-    BOOLEAN *features = data->ProcessorFeatures;
+    BOOLEAN *features = data->ProcessorFeatures, have_x86 = FALSE;
 
     features[PF_FASTFAIL_AVAILABLE]      = TRUE;
     features[PF_COMPARE_EXCHANGE_DOUBLE] = TRUE;
@@ -807,20 +808,53 @@ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
         switch (supported_machines[i])
         {
         case IMAGE_FILE_MACHINE_I386:
-            features[PF_MMX_INSTRUCTIONS_AVAILABLE]    = TRUE;
-            features[PF_XMMI_INSTRUCTIONS_AVAILABLE]   = TRUE;
-            features[PF_RDTSC_INSTRUCTION_AVAILABLE]   = TRUE;
-            features[PF_XMMI64_INSTRUCTIONS_AVAILABLE] = TRUE;
-            features[PF_SSE3_INSTRUCTIONS_AVAILABLE]   = TRUE;
-            features[PF_COMPARE_EXCHANGE128]           = TRUE;
-            features[PF_RDTSCP_INSTRUCTION_AVAILABLE]  = TRUE;
-            features[PF_SSSE3_INSTRUCTIONS_AVAILABLE]  = TRUE;
-            features[PF_SSE4_1_INSTRUCTIONS_AVAILABLE] = TRUE;
-            features[PF_SSE4_2_INSTRUCTIONS_AVAILABLE] = TRUE;
+        case IMAGE_FILE_MACHINE_AMD64:
+            have_x86 = TRUE;
             break;
         }
     }
 #endif
+
+    if (have_x86)
+    {
+        XSTATE_CONFIGURATION *xstate_config = &data->XState;
+
+        features[PF_MMX_INSTRUCTIONS_AVAILABLE]    = TRUE;
+        features[PF_XMMI_INSTRUCTIONS_AVAILABLE]   = TRUE;
+        features[PF_RDTSC_INSTRUCTION_AVAILABLE]   = TRUE;
+        features[PF_XMMI64_INSTRUCTIONS_AVAILABLE] = TRUE;
+        features[PF_SSE3_INSTRUCTIONS_AVAILABLE]   = TRUE;
+        features[PF_COMPARE_EXCHANGE128]           = TRUE;
+        features[PF_XSAVE_ENABLED]                 = TRUE;
+        features[PF_RDTSCP_INSTRUCTION_AVAILABLE]  = TRUE;
+        features[PF_SSSE3_INSTRUCTIONS_AVAILABLE]  = TRUE;
+        features[PF_SSE4_1_INSTRUCTIONS_AVAILABLE] = TRUE;
+        features[PF_SSE4_2_INSTRUCTIONS_AVAILABLE] = TRUE;
+#ifdef WINE_IOS
+        /* Madeira: Wine 11.22 reports AVX/AVX2 and an AVX XState area to every
+         * x86 guest on ARM64, because Microsoft's emulator runs them. Here the
+         * emulator is FEX, where AVX is opt-in (MADEIRA_FEX_AVX=1, ml1310): a
+         * game told "AVX is there" while FEX has it off takes a VEX path and
+         * dies on an illegal instruction. So keep the pre-merge rule: AVX is
+         * advertised only when FEX runs it. MADEIRA_KUSD_AVX=0 still leaves
+         * the XState configuration empty, as in virtual_ios.c. */
+        {
+            const char *avx = getenv( "MADEIRA_FEX_AVX" ), *kusd = getenv( "MADEIRA_KUSD_AVX" );
+            if (!(avx && avx[0] == '1' && !avx[1]) || (kusd && kusd[0] == '0' && !kusd[1])) return;
+        }
+#endif
+        features[PF_AVX_INSTRUCTIONS_AVAILABLE]    = TRUE;
+        features[PF_AVX2_INSTRUCTIONS_AVAILABLE]   = TRUE;
+
+        xstate_config->EnabledFeatures = xstate_config->EnabledVolatileFeatures = XSTATE_MASK_LEGACY | XSTATE_MASK_AVX;
+        xstate_config->Features[XSTATE_LEGACY_FLOATING_POINT].Offset = 0;
+        xstate_config->Features[XSTATE_LEGACY_FLOATING_POINT].Size   = 10 * sizeof(M128A);
+        xstate_config->Features[XSTATE_LEGACY_SSE].Offset = 10 * sizeof(M128A);
+        xstate_config->Features[XSTATE_LEGACY_SSE].Size   = 16 * sizeof(M128A);
+        xstate_config->Features[XSTATE_AVX].Offset = sizeof(XSAVE_AREA);
+        xstate_config->Features[XSTATE_AVX].Size   = sizeof(YMMCONTEXT);
+        xstate_config->Size = xstate_config->AllFeatureSize = sizeof(XSAVE_FORMAT) + sizeof(XSTATE);
+    }
 }
 
 #endif /* End architecture specific feature detection for CPUs */
@@ -1728,7 +1762,7 @@ static void read_dev_urandom( void *buf, ULONG len )
     else WARN( "can't open /dev/urandom\n" );
 }
 
-static void get_random( void *buf, ULONG len )
+void get_random( void *buf, ULONG len )
 {
 #ifdef HAVE_GETRANDOM
     int ret;
@@ -1778,12 +1812,12 @@ void init_cpu_info(void)
         if (want > 0 && want < 64)
         {
             fprintf( stderr, "[madeira] ml1122 cpu-count override: reporting %lld processors (host %ld)\n", want, num );
-            cpu_count = (long)want;
+            /* Wine 11.22: PEB->NumberOfProcessors is now filled from cpu_count
+             * in env.c, so the override is published separately and cpu_count
+             * itself keeps the host value, exactly as before the merge. */
+            madeira_peb_cpu_count = (ULONG)want;
         }
     }
-#endif
-#ifdef WINE_IOS
-    peb->NumberOfProcessors = cpu_count;
 #endif
     init_cpu_model();
     get_random( &process_cookie, sizeof(process_cookie) );
@@ -2744,9 +2778,11 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
     /* Titan Quest refuses to run if TotalPageFile <= TotalPhys */
     if (!totalswap) totalswap = page_size;
 
-#ifdef WINE_IOS
+#ifdef __APPLE__
     {
-        /* Keep the per-app memory limit supplied by Madeira's iOS runtime. */
+        /* madeira-bcd: avail-phys (tools/patch-wine-avail-phys.py): with madeira.cfg
+         * avail-phys = 1, what remains before this app's memory limit when that
+         * is less than the phone's free memory (virtual_ios.c). */
         extern unsigned long long ios_avail_phys( unsigned long long host_free );
         freeram = ios_avail_phys( freeram );
     }

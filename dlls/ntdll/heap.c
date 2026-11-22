@@ -357,6 +357,20 @@ static unsigned int madeira_heap_policy;
 #define MADEIRA_HEAP_RECLAIM 4
 #define MADEIRA_HEAP_STATS 8
 
+/* A heap created with HEAP_CREATE_ENABLE_EXECUTE hands freed bytes out again, and the
+ * program writes new code into them without telling anyone: x86 needs no instruction
+ * cache flush. Wine Mono's dynamic methods live in such a heap. FEX has turned off its
+ * write trap for Mono's process by then (FEX's ml1280), so it would run what it translated
+ * from the old code. Each block handed out from such a heap is flushed from the
+ * translator's cache. MADEIRA_HEAP_EXEC_FLUSH=0 turns this off. */
+static BOOL madeira_heap_exec_flush = TRUE;
+
+static inline void madeira_heap_flush_exec( const struct heap *heap, void *ptr, SIZE_T size )
+{
+    if (madeira_heap_exec_flush && ptr && (heap->flags & HEAP_CREATE_ENABLE_EXECUTE))
+        NtFlushInstructionCache( NtCurrentProcess(), ptr, size );
+}
+
 void heap_init_madeira_policy(void)
 {
     static const WCHAR * const names[] = { L"MADEIRA_HEAP_COMPACT", L"MADEIRA_HEAP_COMBINED",
@@ -373,6 +387,11 @@ void heap_init_madeira_policy(void)
         if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
             value.Length == sizeof(WCHAR) && buffer[0] == '1') madeira_heap_policy |= 1u << i;
     }
+    RtlInitUnicodeString( &name, L"MADEIRA_HEAP_EXEC_FLUSH" );
+    value.Buffer = buffer;
+    value.MaximumLength = sizeof(buffer);
+    if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+        value.Length == sizeof(WCHAR) && buffer[0] == '0') madeira_heap_exec_flush = FALSE;
     if (madeira_heap_policy)
         ERR( "[heap-policy] compact=%u combined=%u reclaim=%u stats=%u\n",
              !!(madeira_heap_policy & MADEIRA_HEAP_COMPACT), !!(madeira_heap_policy & MADEIRA_HEAP_COMBINED),
@@ -2254,6 +2273,54 @@ void heap_thread_detach(void)
     RtlLeaveCriticalSection( &process_heap->cs );
 }
 
+/* Madeira (heap-null-guard): RtlFreeHeap, RtlReAllocateHeap and RtlSizeHeap all fail
+ * cleanly when unsafe_heap_from_handle() says the handle is not a heap, but
+ * RtlAllocateHeap goes on and dereferences the NULL it returned (upstream Wine dropped the
+ * check after 8.0; this puts it back, so Madeira differs from upstream here). On 0.2.41 (Wine 11.22)
+ * dockhost.exe died that way while wininet.dll initialised: "err:heap:unsafe_heap_from_handle
+ * Invalid handle 0000000000000000!", then "AV READ of 8A0" in RtlAllocateHeap and
+ * "wininet.dll failed to initialize". Now the call fails with STATUS_INVALID_HANDLE and
+ * NULL (Wine 8.0's behaviour), and the first 16 such calls log the immediate native caller
+ * (for emulated x64 code that is a thunk or the emulator, not the program). Off:
+ * env MADEIRA_HEAP_NULL_GUARD=0 (back to the fault). */
+static BOOL heap_null_guard( HANDLE handle, SIZE_T size, void *caller )
+{
+    static LONG state;   /* 0 unread, 1 on, 2 off */
+    static LONG logged;
+    LONG st = ReadNoFence( &state );
+
+    if (!st)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_HEAP_NULL_GUARD" );
+        value.Buffer = buffer;
+        value.MaximumLength = sizeof(buffer);
+        st = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+              value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 2 : 1;
+        state = st;
+    }
+    if (st != 1) return FALSE;
+    if (InterlockedIncrement( &logged ) <= 16)
+    {
+        LDR_DATA_TABLE_ENTRY *mod = NULL;
+        ULONG lock_result = 0;
+        ULONG_PTR magic = 0;
+        /* LdrFindEntryForAddress wants the loader lock: try for it, never wait */
+        if (!LdrLockLoaderLock( 2 /* try only */, &lock_result, &magic ) && lock_result == 1)
+        {
+            if (LdrFindEntryForAddress( caller, &mod )) mod = NULL;
+            LdrUnlockLoaderLock( 0, magic );
+        }
+        ERR( "[heap-null-guard] RtlAllocateHeap( %p, size %#Ix ) refused: not a heap; caller %p = %s+%#Ix "
+             "(off: env.MADEIRA_HEAP_NULL_GUARD = 0)\n", handle, size, caller,
+             mod ? debugstr_us( &mod->BaseDllName ) : "?",
+             mod ? (ULONG_PTR)caller - (ULONG_PTR)mod->DllBase : (ULONG_PTR)0 );
+    }
+    return TRUE;
+}
+
 /***********************************************************************
  *           RtlAllocateHeap   (NTDLL.@)
  */
@@ -2273,7 +2340,9 @@ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE
 #ifdef __i386__
 retry:
 #endif
-    if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
+    if (!heap && heap_null_guard( handle, size, __builtin_return_address(0) ))
+        status = STATUS_INVALID_HANDLE;
+    else if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
         status = STATUS_NO_MEMORY;
     else if (block_size >= HEAP_MIN_LARGE_BLOCK_SIZE)
         status = heap_allocate_large( heap, heap_flags, block_size, size, &ptr MADEIRA_CALLER_ARG(caller) );
@@ -2305,6 +2374,7 @@ retry:
         heap_unlock( heap, heap_flags );
         if (released) goto retry;
     }
+    if (!status) madeira_heap_flush_exec( heap, ptr, size );
 #endif
     if (!status) valgrind_notify_alloc( ptr, size, flags & HEAP_ZERO_MEMORY );
 
@@ -2499,6 +2569,10 @@ void *WINAPI RtlReAllocateHeap( HANDLE handle, ULONG flags, void *ptr, SIZE_T si
             status = STATUS_SUCCESS;
         }
     }
+#ifdef __i386__
+    /* A block grown in place takes in freed bytes too; a moved one was flushed by RtlAllocateHeap. */
+    else madeira_heap_flush_exec( heap, ret, size );
+#endif
 
     TRACE( "handle %p, flags %#lx, ptr %p, size %#Ix, return %p, status %#lx.\n", handle, flags, ptr, size, ret, status );
     heap_set_status( heap, flags, status );

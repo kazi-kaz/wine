@@ -53,8 +53,58 @@ static unsigned int MSVCRT_amblksiz = 16;
 /* FIXME - According to documentation it should be 480 bytes, at runtime default is 0 */
 static size_t MSVCRT_sbh_threshold = 0;
 
+/* Madeira (msvcrt-early-heap): Wine 11.22's GetUserNameW() and shell32's
+ * %USERPROFILE% expansion now go through advapi32's LookupAccountSidW(), which
+ * calls malloc().  When a DLL's DllMain runs that path before msvcrt's own
+ * DLL_PROCESS_ATTACH (an import cycle puts wininet ahead of msvcrt on iOS),
+ * 'heap' is still NULL and HeapAlloc(NULL) faults.  Create the heap on first
+ * use instead; msvcrt_init_heap() then keeps it.
+ * Off switch: MADEIRA_MSVCRT_EARLY_HEAP=0 (old behaviour, which faults). */
+static HANDLE msvcrt_create_heap(void)
+{
+#if _MSVCR_VER <= 100
+    return HeapCreate(0, 0, 0);
+#else
+    return GetProcessHeap();
+#endif
+}
+
+/* Set 'heap' once, race-safe: the early path and DLL_PROCESS_ATTACH can both get here. */
+static HANDLE msvcrt_install_heap(void)
+{
+    HANDLE h;
+
+    if (heap) return heap;
+    if (!(h = msvcrt_create_heap())) return NULL;
+    if (InterlockedCompareExchangePointer(&heap, h, NULL))
+    {
+#if _MSVCR_VER <= 100
+        HeapDestroy(h);
+#endif
+    }
+    return heap;
+}
+
+static HANDLE msvcrt_early_heap(void)
+{
+    static LONG logged;
+    DWORD err = GetLastError();
+    WCHAR sw[4];
+    BOOL off = GetEnvironmentVariableW(L"MADEIRA_MSVCRT_EARLY_HEAP", sw, ARRAY_SIZE(sw)) == 1 && sw[0] == '0';
+
+    SetLastError(err);  /* the variable is normally unset; don't leak ERROR_ENVVAR_NOT_FOUND to the caller */
+    if (off) return NULL;
+    if (!msvcrt_install_heap()) return NULL;
+    if (!InterlockedExchange(&logged, 1))
+        ERR("[msvcrt-early-heap] malloc before msvcrt DLL_PROCESS_ATTACH; heap %p created on first use "
+            "(MADEIRA_MSVCRT_EARLY_HEAP=0 disables)\n", heap);
+    return heap;
+}
+
 static void* msvcrt_heap_alloc(DWORD flags, size_t size)
 {
+    if (!heap) msvcrt_early_heap();
+
     if(size < MSVCRT_sbh_threshold)
     {
         void *memblock, *temp, **saved;
@@ -852,12 +902,9 @@ int CDECL wmemcpy_s(wchar_t *dest, size_t numberOfElements,
 
 BOOL msvcrt_init_heap(void)
 {
-#if _MSVCR_VER <= 100
-    heap = HeapCreate(0, 0, 0);
-#else
-    heap = GetProcessHeap();
-#endif
-    return heap != NULL;
+    /* msvcrt-early-heap: keep a heap that malloc() already created, so blocks handed
+     * out before DLL_PROCESS_ATTACH stay freeable. */
+    return msvcrt_install_heap() != NULL;
 }
 
 void msvcrt_destroy_heap(void)

@@ -19,6 +19,8 @@
 
 #define COBJMACROS
 
+#include <stdlib.h>   /* bsearch (bo3-kernelbase-stubs; ntdll exports it) */
+#include <string.h>
 #include "ntstatus.h"
 #include "windows.h"
 #include "appmodel.h"
@@ -36,6 +38,613 @@ WINE_DEFAULT_DEBUG_CHANNEL(kernelbase);
 
 BOOL is_wow64 = FALSE;
 
+/* iOS-Madeira bo3-kernelbase-stubs (Nov 20 2026). kernelbase.spec ends with 497 "@ stub" exports
+ * that real Windows kernelbase.dll has and ours lacked. Black Ops III's anti-tamper walks this
+ * export table by name hash, finds nothing, and calls a null pointer; with the stubs present the
+ * call lands in a stub that logs its own name. Other programs probe exports with GetProcAddress
+ * and would take a stub instead of their fallback, so the stubs stay HIDDEN unless the game's own
+ * config sets env.MADEIRA_KB_STUBS = 1. Hiding = removing their entries from the sorted name
+ * table in place (order kept, so binary search still works) and lowering NumberOfNames. The
+ * functions stay reachable by ordinal only, which nothing uses. Runs once in DllMain. Note: the
+ * exe's static imports are bound before this runs, so a static import of a hidden name still binds
+ * to its stub (today it binds to the loader's own unimplemented stub; both crash on call). */
+static const char * const kb_stub_names[] =
+{
+    "AcquireStateLock",
+    "AddDependencyToProcessPackageGraph",
+    "AddExtensionProgId",
+    "AddPackageToFamilyXref",
+    "AddResourceAttributeAce",
+    "AddSIDToBoundaryDescriptor",
+    "AddScopedPolicyIDAce",
+    "AppContainerDeriveSidFromMoniker",
+    "AppContainerFreeMemory",
+    "AppContainerLookupDisplayNameMrtReference",
+    "AppContainerLookupMoniker",
+    "AppContainerRegisterSid",
+    "AppContainerUnregisterSid",
+    "AppPolicyGetClrCompat",
+    "AppPolicyGetCreateFileAccess",
+    "AppPolicyGetLifecycleManagement",
+    "AppXFreeMemory",
+    "AppXGetApplicationData",
+    "AppXGetDevelopmentMode",
+    "AppXGetOSMaxVersionTested",
+    "AppXGetOSMinVersion",
+    "AppXGetPackageCapabilities",
+    "AppXGetPackageSid",
+    "AppXLookupDisplayName",
+    "AppXLookupMoniker",
+    "AppXPostSuccessExtension",
+    "AppXPreCreationExtension",
+    "AppXReleaseAppXContext",
+    "AppXUpdatePackageCapabilities",
+    "ApplicationUserModelIdFromProductId",
+    "AreThereVisibleLogoffScriptsInternal",
+    "AreThereVisibleShutdownScriptsInternal",
+    "ArmFeatureUsageSubscriberFlushNotification",
+    "BaseCheckAppcompatCacheEx",
+    "BaseFormatObjectAttributes",
+    "BaseFreeAppCompatDataForProcess",
+    "BaseGetConsoleReference",
+    "BaseIsAppcompatInfrastructureDisabled",
+    "BaseMarkFileForDelete",
+    "BaseReadAppCompatDataForProcess",
+    "BasepAdjustObjectAttributesForPrivateNamespace",
+    "BasepCopyFileCallback",
+    "BasepCopyFileExW",
+    "BasepNotifyTrackingService",
+    "CLOSE_LOCAL_HANDLE_INTERNAL",
+    "CallEnclave",
+    "CeipIsOptedIn",
+    "CheckAllowDecryptedRemoteDestinationPolicy",
+    "CheckIfStateChangeNotificationExists",
+    "CheckIsMSIXPackage",
+    "CheckTokenCapability",
+    "CheckTokenMembershipEx",
+    "ClosePackageInfo",
+    "ClosePrivateNamespace",
+    "CloseState",
+    "CloseStateAtom",
+    "CloseStateChangeNotification",
+    "CloseStateContainer",
+    "CloseStateLock",
+    "CommitStateAtom",
+    "CouldMultiUserAppsBehaviorBePossibleForPackage",
+    "CreateAppContainerToken",
+    "CreateEnclave",
+    "CreatePrivateNamespaceW",
+    "CreatePseudoConsoleAsUser",
+    "CreateStateAtom",
+    "CreateStateChangeNotification",
+    "CreateStateContainer",
+    "CreateStateLock",
+    "CreateStateSubcontainer",
+    "CveEventWrite",
+    "DecodeRemotePointer",
+    "DelayLoadFailureHookLookup",
+    "DeleteBoundaryDescriptor",
+    "DeleteEnclave",
+    "DeleteStateAtomValue",
+    "DeleteStateContainer",
+    "DeleteStateContainerValue",
+    "DsBindWithSpnExW",
+    "DsCrackNamesW",
+    "DsFreeDomainControllerInfoW",
+    "DsFreeNameResultW",
+    "DsFreeNgcKey",
+    "DsFreePasswordCredentials",
+    "DsGetDomainControllerInfoW",
+    "DsMakePasswordCredentialsW",
+    "DsReadNgcKeyW",
+    "DsUnBindW",
+    "DsWriteNgcKeyW",
+    "DuplicateStateContainerHandle",
+    "EncodeRemotePointer",
+    "EnterCriticalPolicySectionInternal",
+    "EnumSystemGeoNames",
+    "EnumerateExtensionNames",
+    "EnumerateStateAtomValues",
+    "EnumerateStateContainerItems",
+    "ExtensionProgIdExists",
+    "FindPackagesByPackageFamily",
+    "ForceSyncFgPolicyInternal",
+    "FormatApplicationUserModelId",
+    "FormatApplicationUserModelIdA",
+    "FreeGPOListInternalA",
+    "FreeGPOListInternalW",
+    "GenerateGPNotificationInternal",
+    "GetAdjustObjectAttributesForPrivateNamespaceRoutine",
+    "GetAlternatePackageRoots",
+    "GetAppContainerAce",
+    "GetAppContainerNamedObjectPath",
+    "GetAppDataFolder",
+    "GetAppModelVersion",
+    "GetApplicationRecoveryCallback",
+    "GetApplicationUserModelId",
+    "GetApplicationUserModelIdFromToken",
+    "GetAppliedGPOListInternalA",
+    "GetAppliedGPOListInternalW",
+    "GetCachedSigningLevel",
+    "GetCommPorts",
+    "GetConsoleAliasExesA",
+    "GetConsoleAliasExesW",
+    "GetConsoleAliasesA",
+    "GetConsoleAliasesW",
+    "GetConsoleHistoryInfo",
+    "GetConsoleSelectionInfo",
+    "GetCurrentPackageApplicationContext",
+    "GetCurrentPackageApplicationResourcesContext",
+    "GetCurrentPackageContext",
+    "GetCurrentPackageGlobalizationContext",
+    "GetCurrentPackageInfo2",
+    "GetCurrentPackageInfo3",
+    "GetCurrentPackagePath2",
+    "GetCurrentPackageResourcesContext",
+    "GetCurrentPackageSecurityContext",
+    "GetCurrentTargetPlatformContext",
+    "GetDurationFormatEx",
+    "GetEffectivePackageStatusForUser",
+    "GetEffectivePackageStatusForUserSid",
+    "GetEightBitStringToUnicodeSizeRoutine",
+    "GetEightBitStringToUnicodeStringRoutine",
+    "GetExtensionApplicationUserModelId",
+    "GetExtensionProgIds",
+    "GetExtensionProperty",
+    "GetExtensionProperty2",
+    "GetFileVersionInfoByHandle",
+    "GetGPOListInternalA",
+    "GetGPOListInternalW",
+    "GetGamingDeviceModelInformation",
+    "GetHivePath",
+    "GetIsEdpEnabled",
+    "GetIsWdagEnabled",
+    "GetMemoryErrorHandlingCapabilities",
+    "GetNextFgPolicyRefreshInfoInternal",
+    "GetOsManufacturingMode",
+    "GetOsSafeBootMode",
+    "GetPackageApplicationContext",
+    "GetPackageApplicationIds",
+    "GetPackageApplicationProperty",
+    "GetPackageApplicationPropertyString",
+    "GetPackageApplicationResourcesContext",
+    "GetPackageContext",
+    "GetPackageFamilyNameFromProgId",
+    "GetPackageFamilyNameFromToken",
+    "GetPackageFullNameFromToken",
+    "GetPackageGlobalizationContext",
+    "GetPackageGlobalizationProperty",
+    "GetPackageId",
+    "GetPackageInfo",
+    "GetPackageInfo2",
+    "GetPackageInfo3",
+    "GetPackageInstallTime",
+    "GetPackageOSMaxVersionTested",
+    "GetPackagePath",
+    "GetPackagePathByFullName2",
+    "GetPackagePathOnVolume",
+    "GetPackageProperty",
+    "GetPackagePropertyString",
+    "GetPackageResourcesContext",
+    "GetPackageResourcesProperty",
+    "GetPackageSecurityContext",
+    "GetPackageSecurityProperty",
+    "GetPackageStatus",
+    "GetPackageStatusForUser",
+    "GetPackageStatusForUserSid",
+    "GetPackageTargetPlatformProperty",
+    "GetPackageVolumeSisPath",
+    "GetPersistedFileLocationW",
+    "GetPersistedRegistryLocationW",
+    "GetPersistedRegistryValueW",
+    "GetPreviousFgPolicyRefreshInfoInternal",
+    "GetProcAddressForCaller",
+    "GetProcessDefaultCpuSets",
+    "GetProcessorSystemCycleTime",
+    "GetProtocolAumid",
+    "GetProtocolProperty",
+    "GetPublisherCacheFolder",
+    "GetPublisherRootFolder",
+    "GetRegistryExtensionFlags",
+    "GetRegistryValueWithFallbackW",
+    "GetRoamingLastObservedChangeTime",
+    "GetSecureSystemAppDataFolder",
+    "GetSerializedAtomBytes",
+    "GetSharedLocalFolder",
+    "GetStagedPackageOrigin",
+    "GetStagedPackagePathByFullName",
+    "GetStagedPackagePathByFullName2",
+    "GetStateContainerDepth",
+    "GetStateFolder",
+    "GetStateRootFolder",
+    "GetStateRootFolderBase",
+    "GetStateSettingsFolder",
+    "GetStateVersion",
+    "GetStringScripts",
+    "GetSystemAppDataFolder",
+    "GetSystemAppDataKey",
+    "GetSystemLeapSecondInformation",
+    "GetSystemMetadataPath",
+    "GetSystemMetadataPathForPackage",
+    "GetSystemMetadataPathForPackageFamily",
+    "GetSystemStateRootFolder",
+    "GetSystemTimeAdjustmentPrecise",
+    "GetTargetPlatformContext",
+    "GetThreadInformation",
+    "GetThreadSelectedCpuSets",
+    "GetUnicodeStringToEightBitSizeRoutine",
+    "GetUnicodeStringToEightBitStringRoutine",
+    "GetUserOverrideString",
+    "GetUserOverrideWord",
+    "GuardCheckLongJumpTarget",
+    "HasPolicyForegroundProcessingCompletedInternal",
+    "IncrementPackageStatusVersion",
+    "InitializeEnclave",
+    "InstallELAMCertificateInfo",
+    "InternetTimeFromSystemTimeA",
+    "InternetTimeFromSystemTimeW",
+    "InternetTimeToSystemTimeA",
+    "InternetTimeToSystemTimeW",
+    "InvalidateAppModelVersionCache",
+    "IsDeveloperModePolicyApplied",
+    "IsEnclaveTypeSupported",
+    "IsMrtResourceRedirectionEnabled",
+    "IsOnDemandRegistrationSupportedForExtensionCategory",
+    "IsProcessCritical",
+    "IsSideloadingEnabled",
+    "IsSideloadingPolicyApplied",
+    "IsSyncForegroundPolicyRefresh",
+    "IsTimeZoneRedirectionEnabled",
+    "IsUserCetAvailableInEnvironment",
+    "IsWow64GuestMachineSupported",
+    "KernelbasePostInit",
+    "LeaveCriticalPolicySectionInternal",
+    "LoadEnclaveData",
+    "LoadEnclaveImageA",
+    "LoadEnclaveImageW",
+    "LocalFileTimeToLocalSystemTime",
+    "LocalSystemTimeToLocalFileTime",
+    "MapPredefinedHandleInternal",
+    "MapViewOfFile3FromApp",
+    "MapViewOfFileNuma2",
+    "MoveFileWithProgressTransactedW",
+    "NamedPipeEventEnum",
+    "NamedPipeEventSelect",
+    "OfferVirtualMemory",
+    "OpenCommPort",
+    "OpenGlobalizationUserSettingsKey",
+    "OpenPackageInfoByFullName",
+    "OpenPackageInfoByFullNameForMachine",
+    "OpenPackageInfoByFullNameForUser",
+    "OpenPrivateNamespaceW",
+    "OpenState",
+    "OpenStateAtom",
+    "OpenStateExplicit",
+    "OpenStateExplicitForUserSid",
+    "OpenStateExplicitForUserSidString",
+    "OverrideRoamingDataModificationTimesInRange",
+    "PackageFamilyNameFromFullName",
+    "PackageFamilyNameFromFullNameA",
+    "PackageFamilyNameFromId",
+    "PackageFamilyNameFromIdA",
+    "PackageFamilyNameFromProductId",
+    "PackageFullNameFromIdA",
+    "PackageFullNameFromProductId",
+    "PackageIdFromFullNameA",
+    "PackageIdFromProductId",
+    "PackageNameAndPublisherIdFromFamilyName",
+    "PackageNameAndPublisherIdFromFamilyNameA",
+    "PackageRelativeApplicationIdFromProductId",
+    "PackageSidFromFamilyName",
+    "PackageSidFromProductId",
+    "ParseApplicationUserModelId",
+    "ParseApplicationUserModelIdA",
+    "PcwAddQueryItem",
+    "PcwClearCounterSetSecurity",
+    "PcwCollectData",
+    "PcwCompleteNotification",
+    "PcwCreateNotifier",
+    "PcwCreateQuery",
+    "PcwDisconnectCounterSet",
+    "PcwEnumerateInstances",
+    "PcwIsNotifierAlive",
+    "PcwQueryCounterSetSecurity",
+    "PcwReadNotificationData",
+    "PcwRegisterCounterSet",
+    "PcwRemoveQueryItem",
+    "PcwSendNotification",
+    "PcwSendStatelessNotification",
+    "PcwSetCounterSetSecurity",
+    "PcwSetQueryItemUserData",
+    "PerfDecrementULongCounterValue",
+    "PerfDecrementULongLongCounterValue",
+    "PerfIncrementULongCounterValue",
+    "PerfIncrementULongLongCounterValue",
+    "PerfQueryInstance",
+    "PoolPerAppKeyStateInternal",
+    "ProductIdFromPackageFamilyName",
+    "PsmCreateKey",
+    "PsmCreateKeyWithDynamicId",
+    "PsmEqualApplication",
+    "PsmEqualPackage",
+    "PsmGetApplicationNameFromKey",
+    "PsmGetDynamicIdFromKey",
+    "PsmGetKeyFromProcess",
+    "PsmGetKeyFromToken",
+    "PsmGetPackageFullNameFromKey",
+    "PsmIsChildKey",
+    "PsmIsDynamicKey",
+    "PsmIsValidKey",
+    "PssDuplicateSnapshot",
+    "PssWalkMarkerCreate",
+    "PssWalkMarkerFree",
+    "PssWalkMarkerGetPosition",
+    "PssWalkMarkerSeekToBeginning",
+    "PssWalkMarkerSetPosition",
+    "PssWalkSnapshot",
+    "PublishStateChangeNotification",
+    "PublisherFromPackageFullName",
+    "QueryAuxiliaryCounterFrequency",
+    "QueryGlobalizationUserSettingsStatus",
+    "QueryOptionalDelayLoadedAPI",
+    "QueryProtectedPolicy",
+    "QueryStateAtomValueInfo",
+    "QueryStateContainerCreatedNew",
+    "QueryStateContainerItemInfo",
+    "QuirkGetData",
+    "QuirkGetData2",
+    "QuirkIsEnabled2",
+    "QuirkIsEnabledForPackage",
+    "QuirkIsEnabledForPackage2",
+    "QuirkIsEnabledForPackage3",
+    "QuirkIsEnabledForPackage4",
+    "QuirkIsEnabledForProcess",
+    "RaiseCustomSystemEventTrigger",
+    "ReadDirectoryChangesExW",
+    "ReadStateAtomValue",
+    "ReadStateContainerValue",
+    "ReclaimVirtualMemory",
+    "RecordFeatureUsage2",
+    "RefreshPackageInfo",
+    "RefreshPolicyExInternal",
+    "RefreshPolicyInternal",
+    "RegCreateKeyExInternalA",
+    "RegCreateKeyExInternalW",
+    "RegDeleteKeyExInternalA",
+    "RegDeleteKeyExInternalW",
+    "RegDisablePredefinedCacheEx",
+    "RegKrnGetAppKeyEventAddressInternal",
+    "RegKrnGetAppKeyLoaded",
+    "RegKrnGetClassesEnumTableAddressInternal",
+    "RegKrnGetHKEY_ClassesRootAddress",
+    "RegKrnGetTermsrvRegistryExtensionFlags",
+    "RegKrnResetAppKeyLoaded",
+    "RegKrnSetDllHasThreadStateGlobal",
+    "RegKrnSetTermsrvRegistryExtensionFlags",
+    "RegOpenKeyExInternalA",
+    "RegOpenKeyExInternalW",
+    "RegQueryMultipleValuesA",
+    "RegQueryMultipleValuesW",
+    "RegisterApplicationRestart",
+    "RegisterBadMemoryNotification",
+    "RegisterGPNotificationInternal",
+    "RegisterStateChangeNotification",
+    "RegisterStateLock",
+    "ReleaseStateLock",
+    "RemoveExtensionProgIds",
+    "RemovePackageFromFamilyXref",
+    "RemovePackageStatus",
+    "RemovePackageStatusForUser",
+    "ReplaceFileExInternal",
+    "ResetState",
+    "ResolveDelayLoadsFromDll",
+    "RestoreThreadPreferredUILanguages",
+    "RsopLoggingEnabledInternal",
+    "SHCoCreateInstance",
+    "SHLoadIndirectStringInternal",
+    "SaveAlternatePackageRootPath",
+    "SaveStateRootFolderPath",
+    "SetClientDynamicTimeZoneInformation",
+    "SetClientTimeZoneInformation",
+    "SetComputerNameEx2W",
+    "SetConsoleHistoryInfo",
+    "SetConsoleNumberOfCommandsA",
+    "SetConsoleNumberOfCommandsW",
+    "SetDynamicTimeZoneInformation",
+    "SetExtensionProperty",
+    "SetFileIoOverlappedRange",
+    "SetIsDeveloperModeEnabled",
+    "SetIsSideloadingEnabled",
+    "SetProcessDynamicEHContinuationTargets",
+    "SetProcessDynamicEnforcedCetCompatibleRanges",
+    "SetProcessValidCallTargets",
+    "SetProcessValidCallTargetsForMappedView",
+    "SetProtectedPolicy",
+    "SetProtocolProperty",
+    "SetRoamingLastObservedChangeTime",
+    "SetStateVersion",
+    "SetSystemTimeAdjustmentPrecise",
+    "SetThreadPreferredUILanguages2",
+    "SetThreadpoolWaitEx",
+    "SharedLocalIsEnabled",
+    "StrChrA_MB",
+    "StrChrNIW",
+    "SubscribeEdpEnabledStateChange",
+    "SubscribeFeatureUsageFlush",
+    "SubscribeStateChangeNotification",
+    "SubscribeWdagEnabledStateChange",
+    "TerminateEnclave",
+    "TerminateProcessOnMemoryExhaustion",
+    "TestClose",
+    "TestControlReporting",
+    "TestCreate",
+    "TestOpen",
+    "TestQueryData",
+    "TestRecoverResults",
+    "TestReport",
+    "TestUnlockData",
+    "UnregisterApplicationRestart",
+    "UnregisterBadMemoryNotification",
+    "UnregisterGPNotificationInternal",
+    "UnregisterStateChangeNotification",
+    "UnregisterStateLock",
+    "UnsubscribeEdpEnabledStateChange",
+    "UnsubscribeFeatureUsageFlush",
+    "UnsubscribeStateChangeNotification",
+    "UnsubscribeWdagEnabledStateChange",
+    "UpdatePackageStatus",
+    "UpdatePackageStatusForUser",
+    "UpdatePackageStatusForUserSid",
+    "VerifyApplicationUserModelId",
+    "VerifyApplicationUserModelIdA",
+    "VerifyPackageFamilyName",
+    "VerifyPackageFamilyNameA",
+    "VerifyPackageFullName",
+    "VerifyPackageFullNameA",
+    "VerifyPackageId",
+    "VerifyPackageIdA",
+    "VerifyPackagePublisher",
+    "VerifyPackagePublisherA",
+    "VerifyPackageRelativeApplicationId",
+    "VerifyPackageRelativeApplicationIdA",
+    "VerifyScripts",
+    "VirtualUnlockEx",
+    "WTSGetServiceSessionId",
+    "WTSIsServerContainer",
+    "WaitForMachinePolicyForegroundProcessingInternal",
+    "WaitForUserPolicyForegroundProcessingInternal",
+    "WerRegisterAdditionalProcess",
+    "WerRegisterAppLocalDump",
+    "WerRegisterExcludedMemoryBlock",
+    "WerSetMaxProcessHoldMilliseconds",
+    "WerUnregisterAdditionalProcess",
+    "WerUnregisterAppLocalDump",
+    "WerUnregisterExcludedMemoryBlock",
+    "WerpNotifyLoadStringResource",
+    "WerpNotifyUseStringResource",
+    "Wow64SetThreadDefaultGuestMachine",
+    "Wow64SuspendThread",
+    "WriteStateAtomValue",
+    "WriteStateContainerValue",
+    "_AddMUIStringToCache",
+    "_GetMUIStringFromCache",
+    "_OpenMuiStringCache",
+    "__dllonexit3",
+    "__wgetmainargs",
+    "_amsg_exit",
+    "_c_exit",
+    "_cexit",
+    "_exit",
+    "_initterm",
+    "_initterm_e",
+    "_invalid_parameter",
+    "_onexit",
+    "_purecall",
+    "_time64",
+    "atexit",
+    "exit",
+    "hgets",
+    "hwprintf",
+    "time",
+    "wprintf"
+};
+
+static int __cdecl kb_stub_cmp( const void *a, const void *b )
+{
+    return strcmp( *(const char * const *)a, *(const char * const *)b );
+}
+
+static void kb_stubs_hide( HINSTANCE hinst )
+{
+    WCHAR value[4];
+    DWORD len = GetEnvironmentVariableW( L"MADEIRA_KB_STUBS", value, ARRAY_SIZE(value) );
+    BOOL hide_stubs = !(len == 1 && value[0] == '1');
+    BOOL hide_ntcs;
+    BYTE *base = (BYTE *)hinst;
+    IMAGE_EXPORT_DIRECTORY *exp;
+    DWORD *names, *names_end, total_size, old_names, old_ords, old_dir;
+    WORD *ords;
+    ULONG size, i, kept = 0;
+    SIZE_T names_size, ords_size;
+    void *addr;
+
+    /* (bo3-kb-ntcreatesection) the NtCreateSection pass-through rides on the same switch, and
+     * env.MADEIRA_KB_NTCS = 0 hides it alone */
+    len = GetEnvironmentVariableW( L"MADEIRA_KB_NTCS", value, ARRAY_SIZE(value) );
+    hide_ntcs = hide_stubs || (len == 1 && value[0] == '0');
+    if (!hide_stubs)
+        ERR( "[kb-stubs] %u extra kernelbase exports VISIBLE (env.MADEIRA_KB_STUBS = 1)\n",
+             (unsigned)ARRAY_SIZE(kb_stub_names) );
+    if (!hide_ntcs)
+        ERR( "[kb-ntcs] kernelbase NtCreateSection VISIBLE (env.MADEIRA_KB_NTCS = 0 hides it)\n" );
+    if (!hide_stubs && !hide_ntcs) return;
+    if (!(exp = RtlImageDirectoryEntryToData( hinst, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size )))
+    {
+        ERR( "[kb-stubs] hide FAILED: no export directory, the extra exports stay visible\n" );
+        return;
+    }
+    names = (DWORD *)(base + exp->AddressOfNames);
+    ords = (WORD *)(base + exp->AddressOfNameOrdinals);
+    names_size = exp->NumberOfNames * sizeof(DWORD);
+    ords_size = exp->NumberOfNames * sizeof(WORD);
+
+    addr = exp;
+    total_size = sizeof(*exp);
+    if (!VirtualProtect( addr, total_size, PAGE_READWRITE, &old_dir ))
+    {
+        ERR( "[kb-stubs] hide FAILED: VirtualProtect(dir) error %lu, the extra exports stay visible\n", GetLastError() );
+        return;
+    }
+    if (!VirtualProtect( names, names_size, PAGE_READWRITE, &old_names ))
+    {
+        ERR( "[kb-stubs] hide FAILED: VirtualProtect(names) error %lu, the extra exports stay visible\n", GetLastError() );
+        VirtualProtect( addr, total_size, old_dir, &old_dir );
+        return;
+    }
+    if (!VirtualProtect( ords, ords_size, PAGE_READWRITE, &old_ords ))
+    {
+        ERR( "[kb-stubs] hide FAILED: VirtualProtect(ordinals) error %lu, the extra exports stay visible\n", GetLastError() );
+        VirtualProtect( names, names_size, old_names, &old_names );
+        VirtualProtect( addr, total_size, old_dir, &old_dir );
+        return;
+    }
+    names_end = names + exp->NumberOfNames;
+    for (i = 0; names + i < names_end; i++)
+    {
+        const char *name = (const char *)(base + names[i]);
+        if (hide_stubs && bsearch( &name, kb_stub_names, ARRAY_SIZE(kb_stub_names), sizeof(kb_stub_names[0]), kb_stub_cmp ))
+            continue;
+        if (hide_ntcs && !strcmp( name, "NtCreateSection" )) continue;
+        names[kept] = names[i];
+        ords[kept] = ords[i];
+        kept++;
+    }
+    TRACE( "[kb-stubs] hid %lu of %lu names\n", exp->NumberOfNames - kept, exp->NumberOfNames );
+    exp->NumberOfNames = kept;
+    VirtualProtect( ords, ords_size, old_ords, &old_ords );
+    VirtualProtect( names, names_size, old_names, &old_names );
+    VirtualProtect( addr, total_size, old_dir, &old_dir );
+}
+
+/* iOS-Madeira bo3-kb-ntcreatesection (Nov 21 2026). Black Ops III's anti-tamper hashes kernelbase's
+ * export names (FNV-1a 64, lowercased) looking for "NtCreateSection", finds none, and calls the
+ * null result (proven from its block-ring log). This gives kernelbase a real function under that
+ * name that just calls ntdll's NtCreateSection. It is a real function, not a forwarder: a manual
+ * export walker would call a forwarder's "ntdll.NtCreateSection" string. Exported -private (never in
+ * the import library, so no other dll links to it) and HIDDEN by kb_stubs_hide unless
+ * env.MADEIRA_KB_STUBS = 1; env.MADEIRA_KB_NTCS = 0 hides it alone. The game's code is not touched. */
+NTSTATUS WINAPI kb_NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                    const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags, HANDLE file )
+{
+    static LONG logged;
+    NTSTATUS status = NtCreateSection( handle, access, attr, size, protect, sec_flags, file );
+
+    if (!InterlockedExchange( &logged, 1 ))
+        ERR( "[kb-ntcs] first call: access %#lx protect %#lx flags %#lx file %p -> status %#lx\n",
+             (unsigned long)access, (unsigned long)protect, (unsigned long)sec_flags, file, (unsigned long)status );
+    return status;
+}
+
 /***********************************************************************
  *           DllMain
  */
@@ -49,8 +658,25 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
         init_locale( hinst );
         init_startup_info( NtCurrentTeb()->Peb->ProcessParameters );
         init_console();
+        crash_report_init();   /* (crash-report) reads env.MADEIRA_CRASH_REPORT once */
+        kb_stubs_hide( hinst );   /* (bo3-kernelbase-stubs, bo3-kb-ntcreatesection) env.MADEIRA_KB_STUBS = 1 shows the 497 stubs + NtCreateSection */
     }
     return TRUE;
+}
+
+
+/***********************************************************************
+ *           IsDeveloperModeEnabled   (kernelbase.@)
+ *
+ * Windows' Developer Mode switch. Some games' own d3d12.dll delay-loads it
+ * (api-ms-win-appmodel-unlock-l1-1-0) during DllMain and aborts when it is
+ * missing. Madeira reports Developer Mode as off.
+ */
+HRESULT WINAPI IsDeveloperModeEnabled( BOOL *enabled )
+{
+    FIXME( "(%p) stub, reporting off\n", enabled );
+    if (enabled) *enabled = FALSE;   /* IsBadWritePtr is kernel32's; kernelbase cannot import it */
+    return S_OK;
 }
 
 

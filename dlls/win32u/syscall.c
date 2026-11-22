@@ -170,6 +170,17 @@ static const char *usercall_names[NtUserCallCount] =
 
 static pthread_key_t user_thread_info_key;
 
+#ifdef WINE_IOS
+/* Madeira (ml1122): every pseudo-process that loads win32u runs __wine_unix_lib_init in the
+ * ONE shared unix library. Creating the key again would hand every running thread a new,
+ * empty user_thread_info (and lose its queue, desktop window and message state). */
+static pthread_once_t user_thread_info_key_once = PTHREAD_ONCE_INIT;
+static void create_user_thread_info_key(void)
+{
+    pthread_key_create( &user_thread_info_key, NULL );
+}
+#endif
+
 NTSTATUS __wine_unix_lib_init(void)
 {
 #ifdef _WIN64
@@ -183,9 +194,24 @@ NTSTATUS __wine_unix_lib_init(void)
 #endif
     KeAddSystemServiceTable( syscalls, NULL, ARRAY_SIZE(syscalls), arguments, 1 );
     ntdll_add_syscall_debug_info( 1, syscall_names, usercall_names );
+#ifdef WINE_IOS
+    pthread_once( &user_thread_info_key_once, create_user_thread_info_key );
+#else
     pthread_key_create( &user_thread_info_key, NULL );
+#endif
     return STATUS_SUCCESS;
 }
+
+#ifdef WINE_IOS
+/* Madeira (ml1122): thread_detach() frees the thread's user_thread_info. In Wine 11.4 that
+ * data lived in the TEB, so a late win32u call on the exiting thread was harmless; now it
+ * would read freed memory. Forgetting the pointer makes such a call start from a fresh,
+ * empty info instead. Called by build/win32u-unix/sysparams_ios.c thread_detach(). */
+void ios_forget_user_thread_info(void)
+{
+    pthread_setspecific( user_thread_info_key, NULL );
+}
+#endif
 
 struct user_thread_info *get_user_thread_info(void)
 {

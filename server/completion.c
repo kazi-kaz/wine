@@ -163,10 +163,54 @@ static const struct object_ops completion_ops =
     .destroy      = completion_destroy,
 };
 
+#ifdef WINE_IOS
+/* [pipe-census] (LOG ONLY): every live completion port, so fd_ios.c's 10 s pass
+ * can flag a port that holds queued completions while waiters stay attached
+ * (a lost wake-up). Nothing here changes completion behaviour. */
+#define IOS_COMP_CENSUS_MAX 2048
+static struct completion *ios_comps[IOS_COMP_CENSUS_MAX];
+static unsigned short ios_comp_seen[IOS_COMP_CENSUS_MAX];
+
+static void ios_comp_census_add( struct completion *c )
+{
+    int i;
+    for (i = 0; i < IOS_COMP_CENSUS_MAX; i++)
+        if (!ios_comps[i]) { ios_comps[i] = c; ios_comp_seen[i] = 0; return; }
+}
+
+void ios_completion_census( void )
+{
+    int i, live = 0, queued = 0, stuck = 0, rows = 0;
+    for (i = 0; i < IOS_COMP_CENSUS_MAX; i++)
+    {
+        struct completion *c = ios_comps[i];
+        unsigned int waiters;
+        if (!c) continue;
+        live++;
+        waiters = list_count( &c->wait_queue );
+        if (c->depth) queued++;
+        if (!(c->depth && waiters)) { ios_comp_seen[i] = 0; continue; }
+        if (ios_comp_seen[i] < 0xffff) ios_comp_seen[i]++;
+        if (ios_comp_seen[i] < 2) continue;
+        stuck++;
+        if (rows >= 24) continue;
+        rows++;
+        fprintf( stderr, "[pipe-census] COMPLETION LOST-WAKE? port=%p depth=%u attached-waiters=%u seen=%u\n",
+                 c, c->depth, waiters, ios_comp_seen[i] );
+    }
+    fprintf( stderr, "[pipe-census] ---- completion ports=%d with-queued=%d queued-with-waiters-10s+=%d shown=%d rev=pipe-census-1\n",
+             live, queued, stuck, rows );
+}
+#endif
+
 static void completion_destroy( struct object *obj)
 {
     struct completion *completion = (struct completion *) obj;
     struct comp_msg *tmp, *next;
+
+#ifdef WINE_IOS
+    { int i; for (i = 0; i < IOS_COMP_CENSUS_MAX; i++) if (ios_comps[i] == completion) ios_comps[i] = NULL; }   /* [pipe-census] */
+#endif
 
     LIST_FOR_EACH_ENTRY_SAFE( tmp, next, &completion->queue, struct comp_msg, queue_entry )
     {
@@ -193,6 +237,9 @@ static bool completion_init( struct object *obj, const void *init_data )
     completion->concurrent = data->concurrent;
     list_init( &completion->queue );
     list_init( &completion->wait_queue );
+#ifdef WINE_IOS
+    ios_comp_census_add( completion );   /* [pipe-census] */
+#endif
     return !!(completion->sync = create_internal_sync( 1, 0 ));
 }
 

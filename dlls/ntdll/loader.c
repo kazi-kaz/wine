@@ -162,6 +162,18 @@ typedef struct _wine_modref
     BOOL                  system;
 } WINE_MODREF;
 
+/* context passed around when resolving imports */
+struct import_context
+{
+    const WCHAR            *load_path;
+    WINE_MODREF            *importer;
+    HMODULE                 module;
+    IMAGE_EXPORT_DIRECTORY *exports;
+    DWORD                   exp_size;
+    BOOL                    dynamic;
+    int                     fwd_depth;
+};
+
 static UINT tls_module_count = 32;     /* number of modules with TLS directory */
 static IMAGE_TLS_DIRECTORY *tls_dirs;  /* array of TLS directories */
 
@@ -212,12 +224,8 @@ static LDR_DDAG_NODE *node_ntdll, *node_kernel32;
 
 static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD flags, WINE_MODREF** pwm, BOOL system );
 static NTSTATUS process_attach( LDR_DDAG_NODE *node, LPVOID lpReserved );
-static FARPROC find_ordinal_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports,
-                                    DWORD exp_size, DWORD ordinal, LPCWSTR load_path,
-                                    WINE_MODREF *importer, BOOL is_dynamic );
-static FARPROC find_named_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports, DWORD exp_size,
-                                  const char *name, int hint, LPCWSTR load_path,
-                                  WINE_MODREF *importer, BOOL is_dynamic );
+static NTSTATUS find_ordinal_export( const struct import_context *context, DWORD ordinal, FARPROC *proc );
+static NTSTATUS find_named_export( const struct import_context *context, const char *name, int hint, FARPROC *proc );
 
 /* check whether the file name contains a path */
 static inline BOOL contains_path( LPCWSTR name )
@@ -999,28 +1007,29 @@ static NTSTATUS walk_node_dependencies( LDR_DDAG_NODE *node, void *context,
  * Find the final function pointer for a forwarded function.
  * The loader_section must be locked while calling this function.
  */
-static FARPROC find_forwarded_export( HMODULE module, const char *forward, LPCWSTR load_path, WINE_MODREF *importer, BOOL is_dynamic )
+static NTSTATUS find_forwarded_export( const struct import_context *imp_context, const char *forward,
+                                       FARPROC *proc )
 {
-    const IMAGE_EXPORT_DIRECTORY *exports;
-    DWORD exp_size;
     WINE_MODREF *wm;
     WCHAR mod_name[256];
     const char *end = strrchr(forward, '.');
-    FARPROC proc = NULL;
+    NTSTATUS status = STATUS_PROCEDURE_NOT_FOUND;
     BOOL wm_loaded = FALSE;
+    struct import_context context = *imp_context;
 
-    if (!end) return NULL;
-    if (build_import_name( importer, mod_name, forward, end - forward )) return NULL;
+    if (!end) return status;
+    if (build_import_name( context.importer, mod_name, forward, end - forward )) return status;
+    if (context.fwd_depth++ >= 32) return STATUS_INVALID_IMAGE_FORMAT;
 
     if (!(wm = find_basename_module( mod_name )))
     {
-        WINE_MODREF *imp = get_modref( module );
+        WINE_MODREF *imp = get_modref( imp_context->module );
         TRACE( "delay loading %s for '%s'\n", debugstr_w(mod_name), forward );
-        if (load_dll( load_path, mod_name, 0, &wm, imp->system ) != STATUS_SUCCESS)
+        if (load_dll( context.load_path, mod_name, 0, &wm, imp->system ) != STATUS_SUCCESS)
         {
             ERR( "module not found for forward '%s' used by %s\n",
                  forward, debugstr_w(imp->ldr.FullDllName.Buffer) );
-            return NULL;
+            return status;
         }
         wm_loaded = TRUE;
     }
@@ -1029,38 +1038,32 @@ static FARPROC find_forwarded_export( HMODULE module, const char *forward, LPCWS
     {
         /* Prepare for the callee stealing the reference */
         if (!wm_loaded && wm->ldr.LoadCount != -1) wm->ldr.LoadCount++;
-        add_module_dependency( importer->ldr.DdagNode, wm->ldr.DdagNode );
-        if (is_dynamic && wm_loaded && process_attach( wm->ldr.DdagNode, NULL ) != STATUS_SUCCESS)
+        add_module_dependency( context.importer->ldr.DdagNode, wm->ldr.DdagNode );
+        if (context.dynamic && wm_loaded && process_attach( wm->ldr.DdagNode, NULL ) != STATUS_SUCCESS)
         {
             ERR( "process_attach failed for forward '%s' used by %s\n",
-                 forward, debugstr_w(get_modref( module )->ldr.FullDllName.Buffer) );
+                 forward, debugstr_w( get_modref(imp_context->module)->ldr.FullDllName.Buffer ));
             LdrUnloadDll( wm->ldr.DllBase );
-            return NULL;
+            return status;
         }
     }
 
-    if ((exports = RtlImageDirectoryEntryToData( wm->ldr.DllBase, TRUE,
-                                                 IMAGE_DIRECTORY_ENTRY_EXPORT, &exp_size )))
+    context.module = wm->ldr.DllBase;
+    if ((context.exports = RtlImageDirectoryEntryToData( context.module, TRUE,
+                                                         IMAGE_DIRECTORY_ENTRY_EXPORT, &context.exp_size )))
     {
         const char *name = end + 1;
 
-        if (*name == '#') { /* ordinal */
-            proc = find_ordinal_export( wm->ldr.DllBase, exports, exp_size,
-                                        atoi(name+1) - exports->Base, load_path,
-                                        importer, is_dynamic );
-        } else
-            proc = find_named_export( wm->ldr.DllBase, exports, exp_size, name, -1, load_path,
-                                      importer, is_dynamic );
+        if (*name == '#') /* ordinal */
+            status = find_ordinal_export( &context, atoi(name + 1) - context.exports->Base, proc );
+        else
+            status = find_named_export( &context, name, -1, proc );
     }
 
-    if (!proc)
-    {
-        ERR("function not found for forward '%s' used by %s."
-            " If you are using builtin %s, try using the native one instead.\n",
-            forward, debugstr_w(get_modref(module)->ldr.FullDllName.Buffer),
-            debugstr_w(get_modref(module)->ldr.BaseDllName.Buffer) );
-    }
-    return proc;
+    if (status) ERR( "function not found for forward '%s' used by %s.\n",
+                     forward, debugstr_w( get_modref(imp_context->module)->ldr.FullDllName.Buffer ));
+
+    return status;
 }
 
 
@@ -1071,38 +1074,35 @@ static FARPROC find_forwarded_export( HMODULE module, const char *forward, LPCWS
  * The exports base must have been subtracted from the ordinal already.
  * The loader_section must be locked while calling this function.
  */
-static FARPROC find_ordinal_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports,
-                                    DWORD exp_size, DWORD ordinal, LPCWSTR load_path,
-                                    WINE_MODREF *importer, BOOL is_dynamic )
+static NTSTATUS find_ordinal_export( const struct import_context *context, DWORD ordinal, FARPROC *ret )
 {
     FARPROC proc;
-    const DWORD *functions = get_rva( module, exports->AddressOfFunctions );
+    const DWORD *functions = get_rva( context->module, context->exports->AddressOfFunctions );
 
-    if (ordinal >= exports->NumberOfFunctions)
-    {
-        TRACE("	ordinal %ld out of range!\n", ordinal + exports->Base );
-        return NULL;
-    }
-    if (!functions[ordinal]) return NULL;
+    if (ordinal >= context->exports->NumberOfFunctions) return STATUS_PROCEDURE_NOT_FOUND;
+    if (!functions[ordinal]) return STATUS_PROCEDURE_NOT_FOUND;
 
-    proc = get_rva( module, functions[ordinal] );
+    proc = get_rva( context->module, functions[ordinal] );
 
     /* if the address falls into the export dir, it's a forward */
-    if (((const char *)proc >= (const char *)exports) && 
-        ((const char *)proc < (const char *)exports + exp_size))
-        return find_forwarded_export( module, (const char *)proc, load_path, importer, is_dynamic );
+    if ((const char *)proc >= (const char *)context->exports &&
+        (const char *)proc < (const char *)context->exports + context->exp_size)
+        return find_forwarded_export( context, (const char *)proc, ret );
 
     if (TRACE_ON(snoop))
     {
-        const WCHAR *user = !is_dynamic ? importer->ldr.BaseDllName.Buffer : NULL;
-        proc = SNOOP_GetProcAddress( module, exports, exp_size, proc, ordinal, user );
+        const WCHAR *user = !context->dynamic ? context->importer->ldr.BaseDllName.Buffer : NULL;
+        proc = SNOOP_GetProcAddress( context->module, context->exports, context->exp_size,
+                                     proc, ordinal, user );
     }
     if (TRACE_ON(relay))
     {
-        const WCHAR *user = !is_dynamic ? importer->ldr.BaseDllName.Buffer : NULL;
-        proc = RELAY_GetProcAddress( module, exports, exp_size, proc, ordinal, user );
+        const WCHAR *user = !context->dynamic ? context->importer->ldr.BaseDllName.Buffer : NULL;
+        proc = RELAY_GetProcAddress( context->module, context->exports, context->exp_size,
+                                     proc, ordinal, user );
     }
-    return proc;
+    *ret = proc;
+    return STATUS_SUCCESS;
 }
 
 
@@ -1135,26 +1135,25 @@ static int find_name_in_exports( HMODULE module, const IMAGE_EXPORT_DIRECTORY *e
  * Find an exported function by name.
  * The loader_section must be locked while calling this function.
  */
-static FARPROC find_named_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports, DWORD exp_size,
-                                  const char *name, int hint, LPCWSTR load_path, WINE_MODREF *importer,
-                                  BOOL is_dynamic )
+static NTSTATUS find_named_export( const struct import_context *context, const char *name, int hint,
+                                   FARPROC *proc )
 {
-    const WORD *ordinals = get_rva( module, exports->AddressOfNameOrdinals );
-    const DWORD *names = get_rva( module, exports->AddressOfNames );
+    const WORD *ordinals = get_rva( context->module, context->exports->AddressOfNameOrdinals );
+    const DWORD *names = get_rva( context->module, context->exports->AddressOfNames );
     int ordinal;
 
     /* first check the hint */
-    if (hint >= 0 && hint < exports->NumberOfNames)
+    if (hint >= 0 && hint < context->exports->NumberOfNames)
     {
-        char *ename = get_rva( module, names[hint] );
+        char *ename = get_rva( context->module, names[hint] );
         if (!strcmp( ename, name ))
-            return find_ordinal_export( module, exports, exp_size, ordinals[hint], load_path, importer, is_dynamic );
+            return find_ordinal_export( context, ordinals[hint], proc );
     }
 
     /* then do a binary search */
-    if ((ordinal = find_name_in_exports( module, exports, name )) == -1) return NULL;
-    return find_ordinal_export( module, exports, exp_size, ordinal, load_path, importer, is_dynamic );
-
+    if ((ordinal = find_name_in_exports( context->module, context->exports, name )) == -1)
+        return STATUS_PROCEDURE_NOT_FOUND;
+    return find_ordinal_export( context, ordinal, proc );
 }
 
 
@@ -1343,6 +1342,30 @@ void ios_eager_delay_resolve( const char *when )
 #include "arm64ec_x64_export_iat.c"
 #include "cs_x64_fastpath.c"   /* MADEIRA_CS_X64 / MADEIRA_TLS_X64 */
 
+/* madeira-duo: an EC importer's IAT value for a forwarded export. kernel32's
+ * EnterCriticalSection is NTDLL.RtlEnterCriticalSection, so the name resolves to
+ * ntdll's x64 export thunk, but import_dll redirected it with kernel32's
+ * redirection table, which has no entry for an ntdll address; the fallback then
+ * decodes the thunk's bytes. MADEIRA_CS_X64 rewrites ntdll's critical-section
+ * thunks to `jmp [rip]` to x64 stubs, so every ARM64EC module that imports
+ * Enter/LeaveCriticalSection from kernel32 bound to those stubs and called them
+ * through its exit thunk (dxc4/text3 logs, 4 Nov: ~5,000 round trips a second
+ * from madeira_d3d12 alone). Redirect with the table of the module the address
+ * is in, as a direct import of that module would be; the importer's own table
+ * stays the fallback. The loader_section is held here. */
+static void *arm64ec_redirect_import( HMODULE imp_mod, void *ptr, const IMAGE_ARM64EC_METADATA *imp_metadata )
+{
+    LDR_DATA_TABLE_ENTRY *owner;
+
+    if (ptr && !LdrFindEntryForAddress( ptr, &owner ) && owner->DllBase != imp_mod)
+    {
+        const IMAGE_ARM64EC_METADATA *owner_metadata = arm64ec_get_module_metadata( owner->DllBase );
+
+        if (owner_metadata) return arm64ec_redirect_ptr( owner->DllBase, ptr, owner_metadata );
+    }
+    return arm64ec_redirect_ptr( imp_mod, ptr, imp_metadata );
+}
+
 static BOOL arm64ec_iat_is_exported_x64( HMODULE module, const IMAGE_THUNK_DATA *slot )
 {
     const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module );
@@ -1387,9 +1410,6 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
     BOOL system = wm->system || (wm->ldr.Flags & LDR_WINE_INTERNAL);
     NTSTATUS status;
     WINE_MODREF *wmImp;
-    HMODULE imp_mod;
-    const IMAGE_EXPORT_DIRECTORY *exports;
-    DWORD exp_size;
     const IMAGE_THUNK_DATA *import_list;
     IMAGE_THUNK_DATA *thunk_list;
     WCHAR buffer[256];
@@ -1398,6 +1418,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
     PVOID protect_base;
     SIZE_T protect_size = 0;
     DWORD protect_old;
+    struct import_context context = { .load_path = load_path, .importer = wm };
 
     thunk_list = get_rva( module, (DWORD)descr->FirstThunk );
     if (descr->OriginalFirstThunk)
@@ -1434,10 +1455,9 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
     NtProtectVirtualMemory( NtCurrentProcess(), &protect_base,
                             &protect_size, PAGE_READWRITE, &protect_old );
 
-    imp_mod = wmImp->ldr.DllBase;
-    exports = RtlImageDirectoryEntryToData( imp_mod, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &exp_size );
-
-    if (!exports)
+    context.module = wmImp->ldr.DllBase;
+    if (!(context.exports = RtlImageDirectoryEntryToData( context.module, TRUE,
+                                                          IMAGE_DIRECTORY_ENTRY_EXPORT, &context.exp_size )))
     {
         /* set all imported function to deadbeef */
         while (import_list->u1.Ordinal)
@@ -1478,7 +1498,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
      * x11=garbage. */
     const IMAGE_ARM64EC_METADATA *imp_metadata = NULL;
     if (arm64ec_get_module_metadata( module ))  /* importer is ARM64EC */
-        imp_metadata = arm64ec_get_module_metadata( imp_mod );
+        imp_metadata = arm64ec_get_module_metadata( context.module );
 #endif
 
     while (import_list->u1.Ordinal)
@@ -1489,10 +1509,10 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
         {
             int ordinal = IMAGE_ORDINAL(import_list->u1.Ordinal);
 
-            thunk_list->u1.Function = (ULONG_PTR)find_ordinal_export( imp_mod, exports, exp_size,
-                                                                      ordinal - exports->Base, load_path, wm, FALSE );
-            iat_life_pre = thunk_list->u1.Function;   /* ml701 [iat-life] */
-            if (!thunk_list->u1.Function)
+            NTSTATUS exp_status = find_ordinal_export( &context, ordinal - context.exports->Base,
+                                                       (FARPROC *)&thunk_list->u1.Function );
+            iat_life_pre = exp_status ? 0 : thunk_list->u1.Function;   /* ml701 [iat-life] */
+            if (exp_status)
             {
                 thunk_list->u1.Function = allocate_stub( name, IntToPtr(ordinal) );
                 WARN("No implementation for %s.%d imported from %s, setting to %p\n",
@@ -1501,21 +1521,19 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
             }
 #ifdef __arm64ec__
             else if (imp_metadata && !arm64ec_iat_is_exported_x64( module, thunk_list ))
-                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
-                                                                           (void *)thunk_list->u1.Function,
-                                                                           imp_metadata );
+                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_import( context.module,
+                                                                              (void *)thunk_list->u1.Function,
+                                                                              imp_metadata );
 #endif
             TRACE_(imports)("--- Ordinal %s.%d = %p\n", name, ordinal, (void *)thunk_list->u1.Function );
         }
         else  /* import by name */
         {
-            IMAGE_IMPORT_BY_NAME *pe_name;
-            pe_name = get_rva( module, (DWORD)import_list->u1.AddressOfData );
-            thunk_list->u1.Function = (ULONG_PTR)find_named_export( imp_mod, exports, exp_size,
-                                                                    (const char*)pe_name->Name,
-                                                                    pe_name->Hint, load_path, wm, FALSE );
-            iat_life_pre = thunk_list->u1.Function;   /* ml701 [iat-life] */
-            if (!thunk_list->u1.Function)
+            IMAGE_IMPORT_BY_NAME *pe_name = get_rva( module, (DWORD)import_list->u1.AddressOfData );
+            NTSTATUS exp_status = find_named_export( &context, (const char*)pe_name->Name, pe_name->Hint,
+                                                     (FARPROC *)&thunk_list->u1.Function );
+            iat_life_pre = exp_status ? 0 : thunk_list->u1.Function;   /* ml701 [iat-life] */
+            if (exp_status)
             {
                 thunk_list->u1.Function = allocate_stub( name, (const char*)pe_name->Name );
                 WARN("No implementation for %s.%s imported from %s, setting to %p\n",
@@ -1527,9 +1545,9 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
             {
                 void *pre = (void *)thunk_list->u1.Function;
 
-                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
-                                                                           (void *)thunk_list->u1.Function,
-                                                                           imp_metadata );
+                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_import( context.module,
+                                                                              (void *)thunk_list->u1.Function,
+                                                                              imp_metadata );
                 /* iOS-Madeira ml230: does the EC->EC import bind actually land on native
                  * code, and is that code MARKED EC?
                  *
@@ -2166,6 +2184,56 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
 }
 
 
+/* iOS-Madeira [win32u-first] (default on; env MADEIRA_WIN32U_ATTACH_FIRST = 0 turns it off):
+ * START win32u.dll BEFORE ANY OTHER DLL'S DllMain.
+ *
+ * win32u's syscall stubs call through its own __wine_syscall_dispatcher variable, and only
+ * win32u's DllMain fills it in (win32u/main.c DllMain). Upstream that is always early
+ * enough: gdi32 and user32 import win32u, so the dependency walk below starts win32u
+ * before anything that can reach a GDI/USER call.
+ *
+ * Our runtime links many delay imports as plain imports (build/wine-pe/build-modules.sh,
+ * UNDELAY; in every build since 0.2.37, e.g. sechost -> rpcrt4 -> wininet -> shell32 ->
+ * comctl32). That adds dependency cycles, and Wine's walk skips a module that is already
+ * in progress. So in Satisfactory's game process (0.2.70 log, Epic copy) the walk
+ * went gdi32 -> advapi32 -> sechost -> rpcrt4 -> ... -> comctl32 while gdi32 and user32
+ * were still in progress, ran comctl32's DllMain, whose CreateBitmap(8, 8, 1, 1, ...)
+ * reached NtGdiCreateBitmap (x8=0x10a7) in win32u with the dispatcher still NULL:
+ * "SEGV at pc=0x0", lr = win32u.dll+0x10184.
+ *
+ * win32u imports only ntdll and its DllMain only uses ntdll, so starting it first is
+ * safe in every order. With the switch off nothing changes. */
+static BOOL win32u_first_enabled(void)
+{
+    static int on = -1;
+
+    if (on == -1)
+    {
+        UNICODE_STRING nm, val;
+        WCHAR buf[8];
+        RtlInitUnicodeString( &nm, L"MADEIRA_WIN32U_ATTACH_FIRST" );
+        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+        on = !(!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length == sizeof(WCHAR) && buf[0] == '0');
+    }
+    return on;
+}
+
+static void attach_win32u_first( WINE_MODREF *wm, LPVOID lpReserved )
+{
+    static BOOL tried;  /* one attempt per process (each pseudo-process has its own ntdll) */
+    WINE_MODREF *w32u;
+    NTSTATUS st;
+
+    if (tried || !win32u_first_enabled()) return;
+    if (!(w32u = find_basename_module( L"win32u.dll" )) || w32u == wm) return;
+    if (w32u->ldr.Flags & (LDR_LOAD_IN_PROGRESS | LDR_PROCESS_ATTACHED | LDR_DONT_RESOLVE_REFS)) return;
+    tried = TRUE;
+    st = process_attach( w32u->ldr.DdagNode, lpReserved );
+    ERR( "[win32u-first] started win32u.dll before %s, status %08x (its DllMain sets the syscall dispatcher; off: env.MADEIRA_WIN32U_ATTACH_FIRST = 0)\n",
+         debugstr_us(&wm->ldr.BaseDllName), (unsigned int)st );
+}
+
+
 /*************************************************************************
  *		process_attach
  *
@@ -2217,6 +2285,10 @@ static NTSTATUS process_attach( LDR_DDAG_NODE *node, LPVOID lpReserved )
     if (    ( wm->ldr.Flags & LDR_LOAD_IN_PROGRESS )
          || ( wm->ldr.Flags & LDR_PROCESS_ATTACHED ) )
         return status;
+
+    attach_win32u_first( wm, lpReserved );
+    /* win32u's own dependency walk may have attached this module already (e.g. ntdll) */
+    if (wm->ldr.Flags & LDR_PROCESS_ATTACHED) return status;
 
     TRACE("(%s,%p) - START\n", debugstr_w(wm->ldr.BaseDllName.Buffer), lpReserved );
 
@@ -2668,64 +2740,59 @@ static void fa_attach( HMODULE base )
 NTSTATUS WINAPI LdrGetProcedureAddress(HMODULE module, const ANSI_STRING *name,
                                        ULONG ord, PVOID *address)
 {
-    IMAGE_EXPORT_DIRECTORY *exports;
-    WINE_MODREF *wm;
-    DWORD exp_size;
     NTSTATUS ret = STATUS_PROCEDURE_NOT_FOUND;
+    struct import_context context = { .module = module, .dynamic = TRUE };
 
     RtlEnterCriticalSection( &loader_section );
 
     /* check if the module itself is invalid to return the proper error */
-    if (!(wm = get_modref( module ))) ret = STATUS_DLL_NOT_FOUND;
-    else if ((exports = RtlImageDirectoryEntryToData( module, TRUE,
-                                                      IMAGE_DIRECTORY_ENTRY_EXPORT, &exp_size )))
+    if (!(context.importer = get_modref( module ))) ret = STATUS_DLL_NOT_FOUND;
+    else if ((context.exports = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT,
+                                                              &context.exp_size )))
     {
-        void *proc = name ? find_named_export( module, exports, exp_size, name->Buffer, -1, NULL, wm, TRUE )
-                          : find_ordinal_export( module, exports, exp_size, ord - exports->Base, NULL, wm, TRUE );
-        if (proc)
-        {
-            *address = proc;
-            ret = STATUS_SUCCESS;
-#ifdef __arm64ec__
-            /* Substitute only for the exact module and exact export name;
-             * ordinal lookups and every other module are untouched. The real
-             * pointer is captured first, so a failed resolve can never leave a
-             * wrapper pointing at nothing. */
-            if (tft_ready && name && name->Buffer && module == tft_target)
-            {
-                int i;
-                for (i = 0; i < 5; i++)
-                {
-                    if (strcmp( name->Buffer, tft_names[i] )) continue;
-                    tft_real_slots[i] = proc;
-                    *address = tft_wrappers[i];
-                    if (!tft_beaconed[i]++)
-                        ERR( "[tf-trace] ml734 REDIRECT %s real=%p -> wrapper=%p\n",
-                             tft_names[i], proc, tft_wrappers[i] );
-                    break;
-                }
-            }
-            if (fa_ready && name && name->Buffer && module == fa_target)
-            {
-                int i;
-                for (i = 0; i < 6; i++)
-                {
-                    if (strcmp( name->Buffer, fa_names[i] )) continue;
-                    fa_real_slots[i] = proc;
-                    *address = fa_wrappers[i];
-                    if (!fa_beaconed[i]++)
-                        ERR( "[fa-trace] ml736 REDIRECT %s real=%p -> wrapper=%p\n",
-                             fa_names[i], proc, fa_wrappers[i] );
-                    break;
-                }
-            }
-#endif
-        }
+        if (name)
+            ret = find_named_export( &context, name->Buffer, -1, (FARPROC *)address );
         else
+            ret = find_ordinal_export( &context, ord - context.exports->Base, (FARPROC *)address );
+
+        if (ret) WARN( "%s (ordinal %lu) not found in %s\n", debugstr_a(name ? name->Buffer : NULL),
+                       ord, debugstr_us(&context.importer->ldr.FullDllName) );
+#ifdef __arm64ec__
+        /* Substitute only for the exact module and exact export name;
+         * ordinal lookups and every other module are untouched. The real
+         * pointer is captured first, so a failed resolve can never leave a
+         * wrapper pointing at nothing. */
+        if (!ret && tft_ready && name && name->Buffer && module == tft_target)
         {
-            WARN( "%s (ordinal %lu) not found in %s\n", debugstr_a(name ? name->Buffer : NULL),
-                  ord, debugstr_us(&wm->ldr.FullDllName) );
+            void *proc = *address;
+            int i;
+            for (i = 0; i < 5; i++)
+            {
+                if (strcmp( name->Buffer, tft_names[i] )) continue;
+                tft_real_slots[i] = proc;
+                *address = tft_wrappers[i];
+                if (!tft_beaconed[i]++)
+                    ERR( "[tf-trace] ml734 REDIRECT %s real=%p -> wrapper=%p\n",
+                         tft_names[i], proc, tft_wrappers[i] );
+                break;
+            }
         }
+        if (!ret && fa_ready && name && name->Buffer && module == fa_target)
+        {
+            void *proc = *address;
+            int i;
+            for (i = 0; i < 6; i++)
+            {
+                if (strcmp( name->Buffer, fa_names[i] )) continue;
+                fa_real_slots[i] = proc;
+                *address = fa_wrappers[i];
+                if (!fa_beaconed[i]++)
+                    ERR( "[fa-trace] ml736 REDIRECT %s real=%p -> wrapper=%p\n",
+                         fa_names[i], proc, fa_wrappers[i] );
+                break;
+            }
+        }
+#endif
     }
 
     RtlLeaveCriticalSection( &loader_section );
@@ -2895,6 +2962,164 @@ done:
 }
 
 
+
+#ifdef __arm64ec__
+/* iOS-Madeira [hotpatch-thunks] (env MADEIRA_ARM64X_HOTPATCH_THUNKS = 1; default off, set in
+ * a game's own file): GIVE OUR X64 EXPORT FORWARDERS THE NORMAL HOTPATCH SHAPE.
+ *
+ * In our ARM64EC builtins the linker emits each x64-view forwarder export as a bare
+ * "ff 25 jmp [iat]" in a 16-byte slot (kernel32 has 804, e.g. CloseHandle). Anti-tamper
+ * scanners read that as an inline hook. x86_64 Wine and Windows start such thunks with the
+ * hotpatch prologue "48 8d a4 24 00 00 00 00" (lea 0x0(%rsp),%rsp). When the switch is on,
+ * rewrite each such export in memory, at load, into prologue + the same jump (same IAT slot).
+ * With the switch off nothing is touched and the bytes stay as in the file.
+ * Idea and matching rules adapted from DroidDeck-Proton (LGPL-2.1) commits 269ca79 / 58b9af9
+ * (maxjivi05; research TimmyTurner51, https://github.com/TimmyTurner51/fh6-wine-fex), which do
+ * the same at build time in winebuild for Forza Horizon 6. */
+static BOOL hotpatch_thunks_enabled(void)
+{
+    static int on = -1;
+
+    if (on == -1)
+    {
+        UNICODE_STRING nm, val;
+        WCHAR buf[8];
+        RtlInitUnicodeString( &nm, L"MADEIRA_ARM64X_HOTPATCH_THUNKS" );
+        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+        on = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length == sizeof(WCHAR) && buf[0] == '1');
+    }
+    return on;
+}
+
+static BOOL hotpatch_in_range( ULONG rva, ULONG start, ULONG size )
+{
+    return size && rva >= start && rva - start < size;
+}
+
+/* the jump's slot must be an 8-aligned entry of the IAT or of a delay-load IAT */
+static BOOL hotpatch_is_import_slot( void *module, IMAGE_NT_HEADERS *nt, ULONG rva )
+{
+    const IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+    const IMAGE_DELAYLOAD_DESCRIPTOR *desc;
+    ULONG size, i;
+
+    if (rva & 7) return FALSE;
+    if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT &&
+        hotpatch_in_range( rva, dir->VirtualAddress, dir->Size )) return TRUE;
+    if (!(desc = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &size )))
+        return FALSE;
+    for (; size >= sizeof(*desc) && (desc->DllNameRVA || desc->ImportAddressTableRVA); desc++, size -= sizeof(*desc))
+    {
+        const IMAGE_THUNK_DATA64 *names;
+
+        if (!desc->ImportAddressTableRVA || !desc->ImportNameTableRVA) continue;
+        if (rva < desc->ImportAddressTableRVA || (rva - desc->ImportAddressTableRVA) % 8) continue;
+        if (desc->ImportNameTableRVA >= nt->OptionalHeader.SizeOfImage) continue;
+        names = get_rva( module, desc->ImportNameTableRVA );
+        for (i = 0; (char *)(names + i + 1) <= (char *)module + nt->OptionalHeader.SizeOfImage &&
+                    names[i].u1.Ordinal; i++)
+            if (rva == desc->ImportAddressTableRVA + 8 * i) return TRUE;
+    }
+    return FALSE;
+}
+
+static void hotpatch_x64_thunks( void *module, IMAGE_NT_HEADERS *nt, const UNICODE_STRING *name )
+{
+    static const BYTE prologue[8] = { 0x48, 0x8d, 0xa4, 0x24, 0, 0, 0, 0 };
+    const IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
+    const IMAGE_ARM64EC_METADATA *md;
+    const IMAGE_CHPE_RANGE_ENTRY *map;
+    const IMAGE_EXPORT_DIRECTORY *exp;
+    const DWORD *funcs;
+    ULONG cfg_size, exp_size, exp_rva, image_size = nt->OptionalHeader.SizeOfImage;
+    ULONG i, j, count = 0, done = 0, low = ~0u, high = 0;
+    ULONG *todo;
+
+    if (!hotpatch_thunks_enabled()) return;
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
+    if (!(cfg = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &cfg_size ))) return;
+    cfg_size = min( cfg_size, cfg->Size );
+    if (cfg_size <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) ||
+        cfg->CHPEMetadataPointer <= (ULONG_PTR)module ||
+        cfg->CHPEMetadataPointer + sizeof(*md) > (ULONG_PTR)module + image_size) return;
+    md = (const IMAGE_ARM64EC_METADATA *)cfg->CHPEMetadataPointer;
+    if (!md->CodeMapCount || md->CodeMap >= image_size ||
+        md->CodeMapCount > (image_size - md->CodeMap) / sizeof(*map)) return;
+    map = get_rva( module, md->CodeMap );
+    if (!(exp = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &exp_size ))) return;
+    exp_rva = (char *)exp - (char *)module;
+    if (!exp->NumberOfFunctions || exp->AddressOfFunctions >= image_size ||
+        exp->NumberOfFunctions > (image_size - exp->AddressOfFunctions) / sizeof(DWORD)) return;
+    funcs = get_rva( module, exp->AddressOfFunctions );
+    if (!(todo = RtlAllocateHeap( GetProcessHeap(), 0, exp->NumberOfFunctions * sizeof(*todo) ))) return;
+
+    for (i = 0; i < exp->NumberOfFunctions; i++)
+    {
+        ULONG rva = funcs[i], target;
+        const BYTE *code;
+        BYTE pad;
+        LONG rel;
+
+        if (!rva || (rva & 15) || rva > image_size - 16) continue;
+        if (hotpatch_in_range( rva, exp_rva, exp_size )) continue;  /* forwarder string */
+        for (j = 0; j < md->CodeMapCount; j++)
+        {
+            ULONG start = map[j].StartOffset & ~3u;
+            if ((map[j].StartOffset & 3) == 2 /* AMD64 */ && rva >= start &&
+                rva - start <= map[j].Length && map[j].Length - (rva - start) >= 16) break;
+        }
+        if (j == md->CodeMapCount) continue;
+        code = get_rva( module, rva );
+        if (code[0] != 0xff || code[1] != 0x25) continue;
+        pad = code[6];
+        if (pad && pad != 0xcc) continue;
+        for (j = 7; j < 16; j++) if (code[j] != pad) break;
+        if (j < 16) continue;
+        memcpy( &rel, code + 2, sizeof(rel) );
+        target = rva + 6 + rel;
+        if (!hotpatch_is_import_slot( module, nt, target )) continue;
+        todo[count++] = rva;
+        low = min( low, rva );
+        high = max( high, rva + 16 );
+    }
+
+    if (count)
+    {
+        void *addr = get_rva( module, low );
+        SIZE_T size = high - low;
+        ULONG old_prot;
+
+        if (!NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_READWRITE, &old_prot ))
+        {
+            for (i = 0; i < count; i++)
+            {
+                BYTE *code = get_rva( module, todo[i] );
+                BYTE pad = code[6];
+                LONG rel;
+
+                /* several export names can share one thunk: rewrite it only once */
+                if (code[0] != 0xff || code[1] != 0x25) continue;
+                done++;
+                memcpy( &rel, code + 2, sizeof(rel) );
+                rel -= sizeof(prologue);
+                memcpy( code, prologue, sizeof(prologue) );
+                code[8] = 0xff;
+                code[9] = 0x25;
+                memcpy( code + 10, &rel, sizeof(rel) );
+                code[14] = code[15] = pad;
+            }
+            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old_prot, &old_prot );
+            NtFlushInstructionCache( NtCurrentProcess(), get_rva( module, low ), high - low );
+            ERR( "[hotpatch-thunks] %s: %lu x64 export thunks given the hotpatch prologue\n",
+                 debugstr_us( name ), done );
+        }
+        else ERR( "[hotpatch-thunks] %s: protect failed, left %lu thunks as they are\n",
+                  debugstr_us( name ), count );
+    }
+    RtlFreeHeap( GetProcessHeap(), 0, todo );
+}
+#endif
+
 /*************************************************************************
  *		build_module
  *
@@ -2931,6 +3156,9 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     wm->system = system;
 
     update_load_config( *module );
+#ifdef __arm64ec__
+    if (is_builtin) hotpatch_x64_thunks( *module, nt, nt_name );
+#endif
 
     /* fixup imports */
 
@@ -3081,7 +3309,7 @@ static ULONG read_image_directory( HANDLE file, const SECTION_IMAGE_INFORMATION 
     if (NtReadFile( file, 0, NULL, NULL, &io, &mz, sizeof(mz), &offset, NULL )) return 0;
     if (io.Information != sizeof(mz)) return 0;
     if (mz.e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    offset.QuadPart = mz.e_lfanew;
+    offset.QuadPart = (ULONG)mz.e_lfanew;
     if (NtReadFile( file, 0, NULL, NULL, &io, &nt, sizeof(nt), &offset, NULL )) return 0;
     if (io.Information != sizeof(nt)) return 0;
     if (nt.nt32.Signature != IMAGE_NT_SIGNATURE) return 0;
@@ -3984,6 +4212,39 @@ static BOOL madeira_force_builtin_dll( const WCHAR *name )
     return FALSE;
 }
 
+#ifdef __arm64ec__
+/* iOS-Madeira: the mixed-arch fallback below loads sysx64\<basename> when a
+ * load fails. When the file is simply not there (STATUS_DLL_NOT_FOUND) and the
+ * name is relative with a folder in it, such as the
+ * "12on7\d3d12.dll" that Resident Evil Village probes for, Windows fails the
+ * load and the game takes its normal path. The fallback made that probe
+ * succeed with our d3d12, so the game took its Windows 7 path and asked for
+ * ID3D12DeviceDownlevel. Skip the fallback for such names.
+ * env MADEIRA_FOLDER_FALLBACK_SKIP=0 restores the old behaviour. */
+static BOOL madeira_skip_folder_fallback( const WCHAR *libname )
+{
+    static int enabled = -1;
+    static LONG logged;
+
+    if (!contains_path( libname )) return FALSE;
+    if (RtlDetermineDosPathNameType_U( libname ) != RtlPathTypeRelative) return FALSE;
+    if (enabled < 0)
+    {
+        UNICODE_STRING nm, val;
+        WCHAR buf[8];
+        RtlInitUnicodeString( &nm, L"MADEIRA_FOLDER_FALLBACK_SKIP" );
+        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+        enabled = !(!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) &&
+                    val.Length == sizeof(WCHAR) && buf[0] == '0');
+    }
+    if (!enabled) return FALSE;
+    if (InterlockedIncrement( &logged ) <= 16)
+        ERR( "[folder-fallback] %s not found: no sysx64 fallback for a name with a folder (as on Windows)\n",
+             debugstr_w(libname) );
+    return TRUE;
+}
+#endif
+
 /***********************************************************************
  *	find_dll_file
  *
@@ -4064,9 +4325,11 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
      * back to C:\windows\sysx64, a farm of the full ARM64EC DLL set —
      * Windows' own SysWOW64 pattern. EC sessions' system32 already serves
      * EC binaries, so the retry only ever fires in mixed mode. */
-    if (status == STATUS_INVALID_IMAGE_FORMAT || status == STATUS_DLL_NOT_FOUND)
+    if ((status == STATUS_INVALID_IMAGE_FORMAT || status == STATUS_DLL_NOT_FOUND)
+        && !(status == STATUS_DLL_NOT_FOUND && madeira_skip_folder_fallback( libname )))
     {
         static const WCHAR sysx64W[] = L"\\??\\C:\\windows\\sysx64\\";
+        NTSTATUS first_status = status;
         WCHAR buf[MAX_PATH];
         UNICODE_STRING alt;
         const WCHAR *base = libname, *p;
@@ -4082,7 +4345,7 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
                 if (nt_name->Buffer) RtlFreeUnicodeString( nt_name );
                 if (RtlCreateUnicodeString( nt_name, buf ))
                 {
-                    ERR( "mixed-arch fallback: %s -> %s\n", debugstr_w(libname), debugstr_w(buf) );
+                    ERR( "mixed-arch fallback: %s -> %s (first load status %#lx)\n", debugstr_w(libname), debugstr_w(buf), (long)first_status );
                     status = STATUS_SUCCESS;
                 }
                 else status = STATUS_NO_MEMORY;
@@ -5327,7 +5590,7 @@ PIMAGE_NT_HEADERS WINAPI RtlImageNtHeader(HMODULE hModule)
         ret = NULL;
         if (dos->e_magic == IMAGE_DOS_SIGNATURE)
         {
-            ret = (IMAGE_NT_HEADERS *)((char *)dos + dos->e_lfanew);
+            ret = (IMAGE_NT_HEADERS *)((char *)dos + (ULONG)dos->e_lfanew);
             if (ret->Signature != IMAGE_NT_SIGNATURE) ret = NULL;
         }
     }
@@ -5421,6 +5684,112 @@ static void open_known_dll_ntdir(void)
 }
 
 #ifdef __arm64ec__
+
+/* iOS-Madeira [ldr-order] (env MADEIRA_LDR_WINDOWS_ORDER = 1; default off, set in
+ * a game's own file): THE PEB'S MODULE LISTS IN WINDOWS ORDER.
+ *
+ * In an ARM64EC process the emulator (xtajit64.dll) and its dependency tree load
+ * and initialize before kernel32 is loaded and before ntdll's own attach, so the
+ * lists read
+ *   InLoadOrder/InMemoryOrder: exe, ntdll, xtajit64, ucrtbase, kernel32, kernelbase
+ *   InInitializationOrder:     kernelbase, kernel32, ucrtbase, xtajit64, ..., ntdll
+ * where Windows (and x86_64 Wine) has exe, ntdll, kernel32, kernelbase and ntdll,
+ * kernelbase, kernel32. Code that finds a system DLL by its place in a list
+ * instead of by name then searches the wrong one: Call of Duty Black Ops III
+ * (2026-10-18) walked all 1426 export names of kernelbase -- the first module
+ * initialized -- for an ntdll routine, called the NULL it got back and ended
+ * with an exec AV at 0 seven seconds after start.
+ *
+ * With the switch, ntdll heads InInitializationOrderModuleList before the
+ * emulator attaches (process_attach does not insert a module twice), and once
+ * kernel32 is loaded every module but the exe, ntdll, kernel32 and kernelbase
+ * moves, in its current order, to the end of the load- and memory-order lists.
+ * Lookups by name or base do not depend on either list's order. */
+static BOOL ldr_windows_order_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        UNICODE_STRING nm, val;
+        WCHAR buf[8];
+        RtlInitUnicodeString( &nm, L"MADEIRA_LDR_WINDOWS_ORDER" );
+        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+        on = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length == sizeof(WCHAR) && buf[0] == '1');
+    }
+    return on;
+}
+
+static WINE_MODREF *ldr_order_ntdll(void)
+{
+    MEMORY_BASIC_INFORMATION meminfo;
+
+    if (NtQueryVirtualMemory( GetCurrentProcess(), LdrInitializeThunk, MemoryBasicInformation,
+                              &meminfo, sizeof(meminfo), NULL )) return NULL;
+    return get_modref( meminfo.AllocationBase );
+}
+
+static void ldr_order_ntdll_first(void)
+{
+    WINE_MODREF *ntdll;
+
+    if (!ldr_windows_order_enabled() || !(ntdll = ldr_order_ntdll())) return;
+    if (ntdll->ldr.InInitializationOrderLinks.Flink) return;
+    InsertHeadList( &NtCurrentTeb()->Peb->LdrData->InInitializationOrderModuleList,
+                    &ntdll->ldr.InInitializationOrderLinks );
+    ERR( "[ldr-order] ntdll heads InInitializationOrderModuleList (MADEIRA_LDR_WINDOWS_ORDER)\n" );
+}
+
+static BOOL ldr_order_keeps_place( LDR_DATA_TABLE_ENTRY *mod, WINE_MODREF *exe, WINE_MODREF *ntdll,
+                                   WINE_MODREF *kernel32 )
+{
+    UNICODE_STRING kernelbase = RTL_CONSTANT_STRING( L"kernelbase.dll" );
+
+    return mod == &exe->ldr || mod == &ntdll->ldr || mod == &kernel32->ldr ||
+           RtlEqualUnicodeString( &mod->BaseDllName, &kernelbase, TRUE );
+}
+
+static void ldr_order_move_rest( LIST_ENTRY *list, size_t link, WINE_MODREF *exe, WINE_MODREF *ntdll,
+                                 WINE_MODREF *kernel32 )
+{
+    LIST_ENTRY rest, *entry, *next;
+
+    InitializeListHead( &rest );
+    for (entry = list->Flink; entry != list; entry = next)
+    {
+        next = entry->Flink;
+        if (ldr_order_keeps_place( (LDR_DATA_TABLE_ENTRY *)((char *)entry - link), exe, ntdll, kernel32 ))
+            continue;
+        RemoveEntryList( entry );
+        InsertTailList( &rest, entry );
+    }
+    while (!IsListEmpty( &rest ))
+    {
+        entry = RemoveHeadList( &rest );
+        InsertTailList( list, entry );
+    }
+}
+
+static void ldr_order_windows_lists( WINE_MODREF *exe, WINE_MODREF *kernel32 )
+{
+    PEB_LDR_DATA *ldr = NtCurrentTeb()->Peb->LdrData;
+    WINE_MODREF *ntdll;
+    LIST_ENTRY *entry;
+    int i = 0;
+
+    if (!ldr_windows_order_enabled() || !(ntdll = ldr_order_ntdll())) return;
+    ldr_order_move_rest( &ldr->InLoadOrderModuleList, offsetof( LDR_DATA_TABLE_ENTRY, InLoadOrderLinks ),
+                         exe, ntdll, kernel32 );
+    ldr_order_move_rest( &ldr->InMemoryOrderModuleList, offsetof( LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks ),
+                         exe, ntdll, kernel32 );
+    for (entry = ldr->InLoadOrderModuleList.Flink; entry != &ldr->InLoadOrderModuleList && i < 8; entry = entry->Flink)
+        ERR( "[ldr-order] load #%d %s\n", i++,
+             debugstr_us( &CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks )->BaseDllName ) );
+    i = 0;
+    for (entry = ldr->InInitializationOrderModuleList.Flink;
+         entry != &ldr->InInitializationOrderModuleList && i < 6; entry = entry->Flink)
+        ERR( "[ldr-order] init #%d %s\n", i++,
+             debugstr_us( &CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks )->BaseDllName ) );
+}
 
 static void load_arm64ec_module(void)
 {
@@ -5830,6 +6199,7 @@ void loader_init( CONTEXT *context, void **entry )
          * actctx available so the activeCodePage manifest still applies. */
         locale_init();
         ERR( "loader_init: [iOS] early locale_init done (casemap wired before arm64ec module)\n" );
+        ldr_order_ntdll_first();
         ERR( "loader_init: calling load_arm64ec_module\n" );
         load_arm64ec_module();
         ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
@@ -5844,6 +6214,9 @@ void loader_init( CONTEXT *context, void **entry )
             NtTerminateProcess( GetCurrentProcess(), status );
         }
         node_kernel32 = kernel32->ldr.DdagNode;
+#ifdef __arm64ec__
+        ldr_order_windows_lists( wm, kernel32 );
+#endif
         pBaseThreadInitThunk = RtlFindExportedRoutineByName( kernel32->ldr.DllBase, "BaseThreadInitThunk" );
         LdrGetProcedureAddress( kernel32->ldr.DllBase, &ctrl_routine, 0, (void **)&pCtrlRoutine );
 
@@ -5867,7 +6240,46 @@ void loader_init( CONTEXT *context, void **entry )
     else
     {
 #ifdef _WIN64
-        if (NtCurrentTeb()->WowTebOffset) init_wow64( context );
+#if defined(__aarch64__) || defined(__arm64ec__)
+        /* madeira-bcd [wow64-entry] (env MADEIRA_WOW64_WINDOW_ENTRY = 0 restores
+         * the plain upstream test). Wine 11.x only sends a new thread of a WoW64
+         * process into init_wow64 (the 32-bit side) when its entry is below 4 GB;
+         * a higher entry is taken for a native 64-bit thread and runs the 64-bit
+         * attach path. On iOS a 32-bit process lives in its own 4 GB-aligned host
+         * window, so a 32-bit thread entry is a host VA such as 0x727aec6690
+         * (Battle.net.exe on 0.2.45: "[thr-create] ... start=0x727aec6690"), the
+         * test fails, and the thread runs process_attach( node_ntdll ) with the
+         * 64-bit attach never done in a WoW64 process: "Unhandled exception code
+         * c0000005 ... addr 0x70ffd3230c" = process_attach, READ of 0x0. The TEB of
+         * every thread of such a process sits in the same window, so an entry in
+         * the TEB's 4 GB window is a 32-bit entry too. Elsewhere 32-bit entries and
+         * WoW64 TEBs are both below 4 GB, so the extra test changes nothing.
+         * aarch64 too, not only ARM64EC: the 0.2.45 crash symbolized in the
+         * aarch64 ntdll (loader_init -> process_attach). */
+        {
+            static LONG window_entry_mode;   /* 0 not read yet, 1 off, 2 on */
+            ULONG_PTR entry_va = (ULONG_PTR)*entry;
+
+            if (!window_entry_mode)
+            {
+                UNICODE_STRING name, value;
+                WCHAR buffer[2];
+
+                RtlInitUnicodeString( &name, L"MADEIRA_WOW64_WINDOW_ENTRY" );
+                value.Buffer = buffer;
+                value.Length = 0;
+                value.MaximumLength = sizeof(buffer);
+                window_entry_mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                                     value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+            }
+            if (NtCurrentTeb()->WowTebOffset &&
+                (!(entry_va >> 32) ||
+                 (window_entry_mode == 2 && (entry_va >> 32) == ((ULONG_PTR)NtCurrentTeb() >> 32))))
+                init_wow64( context );
+        }
+#else
+        if (NtCurrentTeb()->WowTebOffset && !((ULONG_PTR)*entry >> 32)) init_wow64( context );
+#endif
 #endif
 #ifdef __arm64ec__
         {

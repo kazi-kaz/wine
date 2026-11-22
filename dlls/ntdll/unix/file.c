@@ -115,6 +115,7 @@
 #include "winioctl.h"
 #include "winternl.h"
 #include "ddk/ntddk.h"
+#include "ntddscsi.h"
 #include "ddk/ntddser.h"
 #include "ddk/ntifs.h"
 #include "ddk/wdm.h"
@@ -229,6 +230,10 @@ struct dir_data
     unsigned int            count;   /* count of used entries in the names array */
     unsigned int            pos;     /* current reading position in the names array */
     struct file_identity    id;      /* directory file identity */
+#ifdef WINE_IOS
+    BOOL                    ios_mtime_valid; /* ios_mtime was read with id */
+    struct timespec         ios_mtime;       /* the directory's mtime when it was read */
+#endif
     struct dir_data_names  *names;   /* directory file names */
     struct dir_data_buffer *buffer;  /* head of data buffers list */
     UNICODE_STRING          mask;    /* the mask used when creating the cache entry */
@@ -253,6 +258,63 @@ static const WCHAR unix_prefixW[] = {'\\','?','?','\\','u','n','i','x'};
 static const BOOL is_case_sensitive = FALSE;
 
 static pthread_mutex_t dir_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#ifdef WINE_IOS
+/* iOS-Madeira: every pseudo-process and the wineserver thread share one unix cwd (open_fd()
+ * fchdir()s to a root directory and back to the server dir, child launches and server connects
+ * fchdir() too), so NtQueryDirectoryFile's fchdir( fd ) + names relative to "." can list or stat
+ * another directory, and an entry whose stat fails is skipped as "no longer exists" without a
+ * word. Terraria's one listing of its Content folder came back without PixelShader.xnb and the
+ * game stopped at "Failed to load asset". dir_mutex only serializes NtQueryDirectoryFile itself.
+ * The readers now use the directory's absolute path (F_GETPATH), set under dir_mutex, and leave
+ * the cwd alone. MADEIRA_DIR_BY_PATH=0 restores the fchdir() read. With MADEIRA_FILE_TRACE=1,
+ * [dir-read] logs each listing: the path, the entries read and the ones skipped. */
+static char ios_dir_path[PATH_MAX];
+static unsigned int ios_dir_gone;   /* entries skipped because their stat failed */
+
+static BOOL ios_dir_read_by_path( int fd )
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_DIR_BY_PATH" );
+        enabled = !(e && e[0] == '0');
+    }
+    ios_dir_path[0] = 0;
+    ios_dir_gone = 0;
+    if (!enabled || fcntl( fd, F_GETPATH, ios_dir_path ) == -1)
+    {
+        ios_dir_path[0] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* the path of a directory entry: absolute while ios_dir_path is set, else name itself */
+static const char *ios_dir_entry_path( const char *name, char *buf, size_t size )
+{
+    if (!ios_dir_path[0] || snprintf( buf, size, "%s/%s", ios_dir_path, name ) >= size) return name;
+    return buf;
+}
+
+static void ios_dir_read_trace( unsigned int status, const IO_STATUS_BLOCK *io, const struct dir_data *data )
+{
+    static int on = -1;
+    static unsigned int n;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_FILE_TRACE" );
+        on = e && e[0] == '1';
+    }
+    if (!on || n >= 2000) return;
+    n++;
+    dprintf( 2, "[dir-read] #%u status=0x%08x bytes=%lu names=%u pos=%u gone=%u by-path=%d path=%s\n",
+             n, status, (unsigned long)io->Information, data ? data->count : 0, data ? data->pos : 0,
+             ios_dir_gone, ios_dir_path[0] != 0, ios_dir_path[0] ? ios_dir_path : "(cwd)" );
+}
+#endif
 
 /* check if a given Unicode char is OK in a DOS short name */
 static inline BOOL is_invalid_dos_char( WCHAR ch )
@@ -570,6 +632,87 @@ static void free_dir_data( struct dir_data *data )
     free( data->mask.Buffer );
     free( data );
 }
+
+#ifdef WINE_IOS
+/* iOS-Madeira: the client half of the directory cache (dir_data_cache) is one array in this
+ * address space, shared by every pseudo-process, but the server hands out its slots per process
+ * (get_directory_cache_entry), so handles of two processes got the same slot. Terraria's first
+ * query of its Content folder found a listing another handle had already read to the end and
+ * returned STATUS_NO_MORE_FILES with nothing in it ([dir-read] names=1 pos=1 on build 32). Each
+ * process now has its own array, switched in under dir_mutex. The server reissues the ids of
+ * dead processes, so a new process drops what a dead one with its id left behind
+ * (madeira_dir_cache_flush_pid, called from server_init_process_done). */
+struct ios_dir_cache
+{
+    struct list        entry;
+    unsigned int       pid;
+    struct dir_data  **cache;
+    unsigned int       size;
+};
+
+static struct list ios_dir_caches = LIST_INIT( ios_dir_caches );
+static struct ios_dir_cache *ios_dir_cache_cur;   /* the process dir_data_cache belongs to */
+
+static unsigned int ios_dir_cache_pid(void)
+{
+    TEB *teb = NtCurrentTeb();
+    return teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueProcess : 0;
+}
+
+/* make dir_data_cache the calling process's array; dir_mutex held */
+static BOOL ios_dir_cache_select(void)
+{
+    unsigned int pid = ios_dir_cache_pid();
+    struct ios_dir_cache *c;
+
+    if (ios_dir_cache_cur && ios_dir_cache_cur->pid == pid) return TRUE;
+    if (ios_dir_cache_cur)
+    {
+        ios_dir_cache_cur->cache = dir_data_cache;
+        ios_dir_cache_cur->size = dir_data_cache_size;
+    }
+    dir_data_cache = NULL;
+    dir_data_cache_size = 0;
+    ios_dir_cache_cur = NULL;
+    LIST_FOR_EACH_ENTRY( c, &ios_dir_caches, struct ios_dir_cache, entry )
+        if (c->pid == pid) goto found;
+    if (!(c = calloc( 1, sizeof(*c) ))) return FALSE;
+    c->pid = pid;
+    list_add_head( &ios_dir_caches, &c->entry );
+found:
+    dir_data_cache = c->cache;
+    dir_data_cache_size = c->size;
+    ios_dir_cache_cur = c;
+    return TRUE;
+}
+
+void madeira_dir_cache_flush_pid(void)
+{
+    unsigned int pid = ios_dir_cache_pid(), i;
+    struct ios_dir_cache *c;
+
+    if (!pid) return;
+    mutex_lock( &dir_mutex );
+    LIST_FOR_EACH_ENTRY( c, &ios_dir_caches, struct ios_dir_cache, entry )
+    {
+        if (c->pid != pid) continue;
+        if (c == ios_dir_cache_cur)
+        {
+            c->cache = dir_data_cache;
+            c->size = dir_data_cache_size;
+            dir_data_cache = NULL;
+            dir_data_cache_size = 0;
+            ios_dir_cache_cur = NULL;
+        }
+        for (i = 0; i < c->size; i++) free_dir_data( c->cache[i] );
+        free( c->cache );
+        list_remove( &c->entry );
+        free( c );
+        break;
+    }
+    mutex_unlock( &dir_mutex );
+}
+#endif
 
 
 /* support for a directory queue for filesystem searches */
@@ -986,22 +1129,10 @@ static BOOLEAN get_dir_case_sensitivity_stat( int root_fd, const char *dir )
         !strcmp( stfs.f_fstypename, "udf" ) ||
         !strcmp( stfs.f_fstypename, "ntfs" ))
         return FALSE;
-#ifdef _DARWIN_FEATURE_64_BIT_INODE
      if (!strcmp( stfs.f_fstypename, "hfs" ) && (stfs.f_fssubtype == 0 ||
                                                  stfs.f_fssubtype == 1 ||
                                                  stfs.f_fssubtype == 128))
         return FALSE;
-#else
-     /* The field says "reserved", but a quick look at the kernel source
-      * tells us that this "reserved" field is really the same as the
-      * "fssubtype" field from the inode64 structure (see munge_statfs()
-      * in <xnu-source>/bsd/vfs/vfs_syscalls.c).
-      */
-     if (!strcmp( stfs.f_fstypename, "hfs" ) && (stfs.f_reserved1 == 0 ||
-                                                 stfs.f_reserved1 == 1 ||
-                                                 stfs.f_reserved1 == 128))
-        return FALSE;
-#endif
 #endif
     return TRUE;
 
@@ -2531,6 +2662,131 @@ static NTSTATUS get_mountmgr_fs_info( HANDLE handle, int fd, struct mountmgr_uni
  *
  * Return a directory entry from the cached data.
  */
+#ifdef WINE_IOS
+/* iOS-Madeira: a short-lived cache of the stat and attributes of directory entries.
+ *
+ * Every entry a listing returns costs lstat() plus one listxattr() per attribute looked up
+ * (two), a stat() of "<dir>/.." for a directory, and a stat() for a symlink, and in the iOS
+ * sandbox each of those calls is slow. Steam's client service (32-bit SteamService.exe)
+ * prepares a CEG game by listing C:\windows and system32 (syswow64, ~1000 entries) about a
+ * thousand times in a row, on new handles each time; on an iPhone that took longer than the
+ * ~100 s Steam waits for the service, so Black Ops 1 (app 42700) never got its binaries
+ * (RemoteCallFailed, 55). On a PC the same listing takes a second or two.
+ *
+ * An entry is answered from the cache while its directory is the same one (device and inode)
+ * with the same mtime as when the entry was stored, so an entry added, removed or renamed
+ * since misses, and for at most MADEIRA_DIR_INFO_CACHE_MS (default 2000, 0 turns the cache
+ * off), so a file changed in place (size, times, attributes) shows up within that time.
+ * NTFS itself only updates a directory entry's size and times lazily. Called with
+ * dir_mutex held. */
+#define IOS_DIR_INFO_SLOTS 8192
+
+struct ios_dir_info
+{
+    char            *name;        /* entry name, NULL if the slot is free */
+    unsigned int     hash;
+    dev_t            dev;         /* directory identity and mtime */
+    ino_t            dir;
+    struct timespec  dir_mtime;
+    ULONGLONG        stamp;       /* monotonic ms when stored */
+    int              ret;         /* get_file_info() result: 0, or -1 for ENOENT */
+    struct stat      st;
+    ULONG            attributes;
+    ULONG            reparse_tag;
+};
+
+static struct ios_dir_info *ios_dir_info;
+
+static int ios_dir_info_ms(void)
+{
+    static int ms = -1;
+
+    if (ms < 0)
+    {
+        const char *e = getenv( "MADEIRA_DIR_INFO_CACHE_MS" );
+        int v = e ? atoi( e ) : 2000;
+        ms = v < 0 ? 0 : v > 10000 ? 10000 : v;
+    }
+    return ms;
+}
+
+static ULONGLONG ios_dir_info_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (ULONGLONG)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static unsigned int ios_dir_info_hash( const struct dir_data *data, const char *name )
+{
+    unsigned int h = 2166136261u;
+
+    while (*name) h = (h ^ (unsigned char)*name++) * 16777619u;
+    h ^= (unsigned int)data->id.ino * 2654435761u;
+    h ^= (unsigned int)data->id.dev * 40503u;
+    return h;
+}
+
+static int ios_get_dir_entry_info( const struct dir_data *data, const char *name, const char *path,
+                                   struct stat *st, ULONG *attributes, ULONG *reparse_tag )
+{
+    int ms = ios_dir_info_ms(), ret;
+    struct ios_dir_info *e;
+    unsigned int hash;
+    ULONGLONG now;
+
+    if (!ms || !data->ios_mtime_valid) return get_file_info( path, st, attributes, reparse_tag );
+    if (!ios_dir_info && !(ios_dir_info = calloc( IOS_DIR_INFO_SLOTS, sizeof(*ios_dir_info) )))
+        return get_file_info( path, st, attributes, reparse_tag );
+
+    hash = ios_dir_info_hash( data, name );
+    e = &ios_dir_info[hash & (IOS_DIR_INFO_SLOTS - 1)];
+    now = ios_dir_info_now();
+    if (e->name && e->hash == hash && e->dev == data->id.dev && e->dir == data->id.ino &&
+        e->dir_mtime.tv_sec == data->ios_mtime.tv_sec && e->dir_mtime.tv_nsec == data->ios_mtime.tv_nsec &&
+        now - e->stamp < (ULONGLONG)ms && !strcmp( e->name, name ))
+    {
+        if (e->ret == -1)
+        {
+            errno = ENOENT;
+            return -1;
+        }
+        *st = e->st;
+        *attributes = e->attributes;
+        *reparse_tag = e->reparse_tag;
+        return e->ret;
+    }
+
+    ret = get_file_info( path, st, attributes, reparse_tag );
+    if (ret == -1 && errno != ENOENT) return ret;
+
+    if (!e->name || strcmp( e->name, name ))
+    {
+        free( e->name );
+        if (!(e->name = strdup( name ))) return ret;
+    }
+    e->hash = hash;
+    e->dev = data->id.dev;
+    e->dir = data->id.ino;
+    e->dir_mtime = data->ios_mtime;
+    e->stamp = now;
+    e->ret = ret;
+    if (ret != -1)
+    {
+        e->st = *st;
+        e->attributes = *attributes;
+        e->reparse_tag = *reparse_tag;
+    }
+    else errno = ENOENT;
+    return ret;
+}
+
+/* get_dir_data_entry() below reads entry info through the cache */
+#define get_file_info( path, st, attributes, reparse_tag ) \
+    ios_get_dir_entry_info( dir_data, names->unix_name, path, st, attributes, reparse_tag )
+#endif
+
 static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, IO_STATUS_BLOCK *io,
                                     ULONG max_length, FILE_INFORMATION_CLASS class,
                                     union file_directory_info **last_info )
@@ -2539,10 +2795,19 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     union file_directory_info *info;
     struct stat st;
     ULONG name_len, start, dir_size, attributes, reparse_tag;
+    const char *path = names->unix_name;
+#ifdef WINE_IOS
+    char full[PATH_MAX];
 
-    if (get_file_info( names->unix_name, &st, &attributes, &reparse_tag ) == -1)
+    path = ios_dir_entry_path( names->unix_name, full, sizeof(full) );
+#endif
+
+    if (get_file_info( path, &st, &attributes, &reparse_tag ) == -1)
     {
         TRACE( "file no longer exists %s\n", debugstr_a(names->unix_name) );
+#ifdef WINE_IOS
+        ios_dir_gone++;
+#endif
         return STATUS_SUCCESS;
     }
     if (is_ignored_file( &st ))
@@ -2632,6 +2897,10 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     return name_len > max_length ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
 }
 
+#ifdef WINE_IOS
+#undef get_file_info
+#endif
+
 #ifdef VFAT_IOCTL_READDIR_BOTH
 
 /***********************************************************************
@@ -2706,6 +2975,11 @@ static NTSTATUS read_directory_data_getattrlist( struct dir_data *data, const ch
         char name[NAME_MAX * 3 + 1];
     } buffer;
 #pragma pack(pop)
+#ifdef WINE_IOS
+    char full[PATH_MAX];
+
+    unix_name = ios_dir_entry_path( unix_name, full, sizeof(full) );
+#endif
 
     memset( &attrlist, 0, sizeof(attrlist) );
     attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
@@ -2740,10 +3014,17 @@ static NTSTATUS read_directory_data_getattrlist( struct dir_data *data, const ch
 static NTSTATUS read_directory_data_stat( struct dir_data *data, const char *unix_name )
 {
     struct stat st;
+    const char *dir = ".", *path = unix_name;
+#ifdef WINE_IOS
+    char full[PATH_MAX];
+
+    if (ios_dir_path[0]) dir = ios_dir_path;
+    path = ios_dir_entry_path( unix_name, full, sizeof(full) );
+#endif
 
     /* if the file system is not case sensitive we can't find the actual name through stat() */
-    if (!get_dir_case_sensitivity( AT_FDCWD, "." )) return STATUS_NO_SUCH_FILE;
-    if (stat( unix_name, &st ) == -1) return STATUS_NO_SUCH_FILE;
+    if (!get_dir_case_sensitivity( AT_FDCWD, dir )) return STATUS_NO_SUCH_FILE;
+    if (stat( path, &st ) == -1) return STATUS_NO_SUCH_FILE;
 
     TRACE( "found %s\n", debugstr_a(unix_name) );
 
@@ -2762,7 +3043,11 @@ static NTSTATUS read_directory_data_readdir( struct dir_data *data, const UNICOD
 {
     struct dirent *de;
     NTSTATUS status = STATUS_NO_MEMORY;
+#ifdef WINE_IOS
+    DIR *dir = opendir( ios_dir_path[0] ? ios_dir_path : "." );
+#else
     DIR *dir = opendir( "." );
+#endif
 
     if (!dir) return STATUS_NO_SUCH_FILE;
 
@@ -2867,6 +3152,17 @@ static NTSTATUS init_cached_dir_data( struct dir_data **data_ret, int fd, const 
         fstat( fd, &st );
         data->id.dev = st.st_dev;
         data->id.ino = st.st_ino;
+#ifdef WINE_IOS
+        data->ios_mtime.tv_sec = st.st_mtime;
+#ifdef HAVE_STRUCT_STAT_ST_MTIM
+        data->ios_mtime.tv_nsec = st.st_mtim.tv_nsec;
+#elif defined(HAVE_STRUCT_STAT_ST_MTIMESPEC)
+        data->ios_mtime.tv_nsec = st.st_mtimespec.tv_nsec;
+#else
+        data->ios_mtime.tv_nsec = 0;
+#endif
+        data->ios_mtime_valid = TRUE;
+#endif
     }
 
     TRACE( "mask %s found %u files\n", debugstr_us( mask ), data->count );
@@ -2907,6 +3203,9 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
     unsigned int status;
     BOOLEAN fresh_handle;
 
+#ifdef WINE_IOS
+    if (!ios_dir_cache_select()) return STATUS_NO_MEMORY;
+#endif
     SERVER_START_REQ( get_directory_cache_entry )
     {
         req->handle = wine_server_obj_handle( handle );
@@ -2975,8 +3274,9 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
 {
     int cwd, fd, needs_close;
     enum server_fd_type type;
-    struct dir_data *data;
+    struct dir_data *data = NULL;
     unsigned int status;
+    BOOL by_path = FALSE;
 
     TRACE("(%p %p %p %p %p %p 0x%08x 0x%08x 0x%08x %s 0x%08x\n",
           handle, event, apc_routine, apc_context, io, buffer,
@@ -3028,8 +3328,11 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
 
     mutex_lock( &dir_mutex );
 
-    cwd = open( ".", O_RDONLY );
-    if (fchdir( fd ) != -1)
+#ifdef WINE_IOS
+    by_path = ios_dir_read_by_path( fd );
+#endif
+    cwd = by_path ? -1 : open( ".", O_RDONLY );
+    if (by_path || fchdir( fd ) != -1)
     {
         if (!(status = get_cached_dir_data( handle, &data, fd, mask, restart_scan )))
         {
@@ -3045,11 +3348,15 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
             if (!last_info) status = STATUS_NO_MORE_FILES;
             else if (status == STATUS_MORE_ENTRIES) status = STATUS_SUCCESS;
         }
-        if (cwd == -1 || fchdir( cwd ) == -1) chdir( "/" );
+        if (!by_path && (cwd == -1 || fchdir( cwd ) == -1)) chdir( "/" );
     }
     else status = errno_to_status( errno );
 
     if (status != STATUS_NO_SUCH_FILE) io->Status = status;
+#ifdef WINE_IOS
+    ios_dir_read_trace( status, io, data );
+    ios_dir_path[0] = 0;
+#endif
 
     mutex_unlock( &dir_mutex );
 
@@ -4840,6 +5147,148 @@ static void madeira_pipe_trace( HANDLE handle, const void *buffer, ULONG length 
 }
 #endif
 
+#ifdef WINE_IOS
+/* x64-ntdll-file: x64 programs that read system DLLs from disk get the x64 (arm64ec) file.
+ *
+ * StarCraft's ClientSdk.dll opens C:\windows\system32\ntdll.dll (an anti-hook scheme), reads it into
+ * its own RWX page, finds the Nt* exports and calls them as x64 syscall stubs. In a prefix whose
+ * session is native ARM64, system32\ntdll.dll is the plain aarch64 build, whose exports are ARM64
+ * stubs ("mov x8,#id; ... blr x16"), so FEX ran ARM64 bytes as x86 and the program died with
+ * c0000005. On Windows ARM64 that path is the ARM64X/EC file, whose x64-visible exports are x64
+ * stubs ("mov r10,rcx; mov eax,id; ... syscall; ret"). C:\windows\sysx64 holds the arm64ec build
+ * (see WineProcessBridge.m, farm sysx64 -> arm64ec-windows), so an open (FILE_OPEN) of system32\ntdll.dll
+ * or system32\win32u.dll from an x64/ARM64EC process is answered from sysx64 instead.
+ *
+ * x64-system32-files: the same for every other DLL there. An anti-tamper or launcher check that reads
+ * system32\kernel32.dll (or kernelbase, user32, advapi32, crypt32, ...) from disk and compares it with the
+ * loaded module got the aarch64 file (Machine 0xAA64, ARM64 .text) while the module in memory is the EC build.
+ * Redirected: a single file name directly under \??\C:\windows\system32\ that ends in .dll, .drv or .ocx,
+ * FILE_OPEN, no RootDirectory, opened without write/delete access, from an x64/ARM64EC process, only when the
+ * sysx64 file exists. .exe is left alone on purpose: CreateProcess opens the image through this call, and
+ * a system32 .exe is native ARM64 on Windows ARM, so redirecting it would turn an ARM64 child into an x64 one.
+ * NtQueryAttributesFile / NtQueryFullAttributesFile on the same names answer from the same sysx64 file, so a size
+ * or time comparison agrees with what the open returns. i386 and native aarch64 processes are left alone
+ * (ios_is_arm64ec_cur() is false for them). MADEIRA_X64_NTDLL_FILE=0 turns all of it off.
+ * Logging: [x64-ntdll-file] #n <from> -> <to> once per distinct file (up to 128). */
+extern int ios_is_arm64ec_cur(void);
+
+#define IOS_X64_NAME_MAX 64   /* longest file name (characters) that is redirected */
+#define IOS_X64_BUF_CHARS 96  /* sysx64 prefix (22) + IOS_X64_NAME_MAX + NUL */
+#define IOS_X64_WRITE_ACCESS (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | \
+                              DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)
+
+static BOOL ios_x64_ntdll_file_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_X64_NTDLL_FILE" );
+        on = !(e && e[0] == '0' && !e[1]);
+    }
+    return on;
+}
+
+static BOOL ios_x64_ntdll_name_match( const WCHAR *w, const char *lit, unsigned int n )
+{
+    unsigned int i;
+    for (i = 0; i < n; i++)
+    {
+        WCHAR c = w[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != (WCHAR)lit[i]) return FALSE;
+    }
+    return TRUE;
+}
+
+/* Fills *out (backed by buf, IOS_X64_BUF_CHARS WCHARs) with the sysx64 name when name is
+ * system32\<file>.dll / .drv / .ocx. The file name keeps the caller's spelling. */
+static BOOL ios_x64_ntdll_redirect( const UNICODE_STRING *name, WCHAR *buf, UNICODE_STRING *out )
+{
+    static const char sys32[] = "\\??\\c:\\windows\\system32\\";
+    static const char sysx64[] = "\\??\\C:\\windows\\sysx64\\";
+    static const char *const exts[] = { ".dll", ".drv", ".ocx" };
+    unsigned int len = name->Length / sizeof(WCHAR), fl, i, k;
+    const WCHAR *file;
+
+    if (len <= sizeof(sys32) - 1 || !ios_x64_ntdll_name_match( name->Buffer, sys32, sizeof(sys32) - 1 )) return FALSE;
+    file = name->Buffer + sizeof(sys32) - 1;
+    fl = len - (sizeof(sys32) - 1);
+    if (fl <= 4 || fl > IOS_X64_NAME_MAX) return FALSE;
+    for (k = 0; k < fl; k++)
+        if (file[k] == '\\' || file[k] == '/' || file[k] == ':' || !file[k]) return FALSE;   /* one component only */
+    for (i = 0; i < ARRAY_SIZE(exts); i++)
+        if (ios_x64_ntdll_name_match( file + fl - 4, exts[i], 4 )) break;
+    if (i == ARRAY_SIZE(exts)) return FALSE;
+    for (k = 0; k < sizeof(sysx64) - 1; k++) buf[k] = sysx64[k];
+    for (k = 0; k < fl; k++) buf[sizeof(sysx64) - 1 + k] = file[k];
+    buf[sizeof(sysx64) - 1 + fl] = 0;
+    out->Buffer = buf;
+    out->Length = (sizeof(sysx64) - 1 + fl) * sizeof(WCHAR);
+    out->MaximumLength = out->Length + sizeof(WCHAR);
+    return TRUE;
+}
+
+/* One log line per distinct redirected file (hash of the lower-cased target and the kind), at most 128. */
+static void ios_x64_ntdll_log( int attr_query, const UNICODE_STRING *from, const UNICODE_STRING *to )
+{
+    static unsigned int seen[128];
+    static int nseen, logged;
+    char fb[112], tb[112];
+    unsigned int h = 2166136261u ^ (unsigned int)attr_query, k, n;
+    int i, cur = __atomic_load_n( &nseen, __ATOMIC_RELAXED );
+
+    n = to->Length / 2;
+    for (k = 0; k < n; k++)
+    {
+        WCHAR c = to->Buffer[k];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        h = (h ^ (unsigned int)c) * 16777619u;
+    }
+    for (i = 0; i < cur && i < 128; i++) if (seen[i] == h) return;
+    if (cur >= 128) return;
+    seen[cur] = h;
+    __atomic_store_n( &nseen, cur + 1, __ATOMIC_RELAXED );
+    n = from->Length / 2;
+    for (k = 0; k < n && k < sizeof(fb) - 1; k++) fb[k] = (char)from->Buffer[k];
+    fb[k] = 0;
+    n = to->Length / 2;
+    for (k = 0; k < n && k < sizeof(tb) - 1; k++) tb[k] = (char)to->Buffer[k];
+    tb[k] = 0;
+    if (attr_query) dprintf( 2, "[x64-ntdll-file] #%d attr %s -> %s\n", ++logged, fb, tb );
+    else dprintf( 2, "[x64-ntdll-file] #%d %s -> %s\n", ++logged, fb, tb );
+}
+
+/* NtQueryAttributesFile / NtQueryFullAttributesFile: names for attr, from the sysx64 file when the
+ * redirect applies and that file exists, otherwise exactly as before. */
+static NTSTATUS ios_x64_attr_names( const OBJECT_ATTRIBUTES *attr, OBJECT_ATTRIBUTES *new_attr,
+                                    UNICODE_STRING *nt_name, char **unix_name )
+{
+    UNICODE_STRING x64_name;
+    WCHAR x64_buf[IOS_X64_BUF_CHARS];
+    NTSTATUS status;
+
+    *unix_name = NULL;
+    nt_name->Buffer = NULL;
+    if (!attr->RootDirectory && attr->ObjectName && ios_x64_ntdll_file_enabled() &&
+        ios_x64_ntdll_redirect( attr->ObjectName, x64_buf, &x64_name ) && ios_is_arm64ec_cur())
+    {
+        new_attr->ObjectName = &x64_name;
+        status = get_nt_and_unix_names( new_attr, nt_name, unix_name, FILE_OPEN, TRUE );
+        new_attr->ObjectName = attr->ObjectName;   /* x64_name is about to go out of scope */
+        if (!status)
+        {
+            ios_x64_ntdll_log( 1, attr->ObjectName, &x64_name );
+            return status;
+        }
+        free( *unix_name );
+        free( nt_name->Buffer );
+        *unix_name = NULL;
+        nt_name->Buffer = NULL;
+    }
+    return get_nt_and_unix_names( new_attr, nt_name, unix_name, FILE_OPEN, TRUE );
+}
+#endif /* WINE_IOS */
+
 /******************************************************************************
  *              NtCreateFile   (NTDLL.@)
  */
@@ -4908,6 +5357,12 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     BOOL name_hidden = FALSE;
     BOOL created = FALSE;
     unsigned int status;
+#ifdef WINE_IOS
+    /* function scope: new_attr.ObjectName may point at x64_name until the end of the call */
+    UNICODE_STRING x64_name;
+    WCHAR x64_buf[IOS_X64_BUF_CHARS];
+    BOOL x64_redirected = FALSE;
+#endif
 
     TRACE( "handle=%p access=%08x name=%s objattr=%08x root=%p sec=%p io=%p alloc_size=%p "
            "attr=%08x sharing=%08x disp=%d options=%08x ea=%p.0x%08x\n",
@@ -4929,8 +5384,36 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
         status = file_id_to_unix_file_name( &new_attr, &unix_name, &nt_name );
         if (!status) new_attr.ObjectName = &nt_name;
     }
-    else status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
-                                         options & FILE_OPEN_REPARSE_POINT );
+    else
+    {
+#ifdef WINE_IOS
+        if (!attr->RootDirectory && disposition == FILE_OPEN && !(access & IOS_X64_WRITE_ACCESS) &&
+            ios_x64_ntdll_file_enabled() &&
+            ios_x64_ntdll_redirect( attr->ObjectName, x64_buf, &x64_name ) && ios_is_arm64ec_cur())
+        {
+            new_attr.ObjectName = &x64_name;
+            status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
+                                            options & FILE_OPEN_REPARSE_POINT );
+            if (!status)
+            {
+                x64_redirected = TRUE;
+                ios_x64_ntdll_log( 0, attr->ObjectName, &x64_name );
+            }
+            else
+            {
+                /* no sysx64 copy: fall back to the name the caller gave */
+                free( unix_name );
+                free( nt_name.Buffer );
+                unix_name = NULL;
+                nt_name.Buffer = NULL;
+                new_attr = *attr;
+            }
+        }
+        if (!x64_redirected)
+#endif
+        status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
+                                        options & FILE_OPEN_REPARSE_POINT );
+    }
 
     if (status == STATUS_BAD_DEVICE_TYPE)
     {
@@ -5231,7 +5714,11 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     OBJECT_ATTRIBUTES new_attr = *attr;
     HANDLE file;
 
+#ifdef WINE_IOS
+    status = ios_x64_attr_names( attr, &new_attr, &nt_name, &unix_name );
+#else
     status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE );
+#endif
     if (status == STATUS_BAD_DEVICE_TYPE &&
         !(status = server_open_file_object( &file, 0, &new_attr, 0, 0 )))
     {
@@ -5271,7 +5758,12 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
 
+#ifdef WINE_IOS
+    status = ios_x64_attr_names( attr, &new_attr, &nt_name, &unix_name );
+    if (!status)
+#else
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
+#endif
     {
         ULONG attributes;
         struct stat st;
@@ -5663,16 +6155,28 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 }
 
 
+static NTSTATUS server_set_file_info( HANDLE handle, IO_STATUS_BLOCK *io,
+                                      void *ptr, ULONG len, FILE_INFORMATION_CLASS class );
+
+
 /******************************************************************************
  *              NtSetInformationFile   (NTDLL.@)
  */
 NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                                       void *ptr, ULONG len, FILE_INFORMATION_CLASS class )
 {
-    int fd, needs_close;
+    int fd, needs_close = 0;
     unsigned int status = STATUS_SUCCESS;
+    unsigned int access = (class == FileValidDataLengthInformation) ? FILE_WRITE_DATA : 0;
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class );
+
+    if (class != FileCompletionInformation &&
+        (status = server_get_unix_fd( handle, access, &fd, &needs_close, NULL, NULL )))
+    {
+        if (status != STATUS_BAD_DEVICE_TYPE) return io->Status = status;
+        return server_set_file_info( handle, io, ptr, len, class );
+    }
 
     switch (class)
     {
@@ -5682,9 +6186,6 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             const FILE_BASIC_INFORMATION *info = ptr;
             LARGE_INTEGER mtime, atime;
             char *unix_name;
-
-            if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
-                return io->Status = status;
 
             if (server_get_unix_name( handle, &unix_name )) unix_name = NULL;
 
@@ -5698,7 +6199,6 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 status = fd_set_file_info( fd, info->FileAttributes,
                                            unix_name && is_hidden_file( unix_name ));
 
-            if (needs_close) close( fd );
             free( unix_name );
         }
         else status = STATUS_INVALID_PARAMETER_3;
@@ -5709,80 +6209,10 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             const FILE_POSITION_INFORMATION *info = ptr;
 
-            if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
-                return io->Status = status;
-
             if (lseek( fd, info->CurrentByteOffset.QuadPart, SEEK_SET ) == (off_t)-1)
                 status = errno_to_status( errno );
-
-            if (needs_close) close( fd );
         }
         else status = STATUS_INVALID_PARAMETER_3;
-        break;
-
-    case FileEndOfFileInformation:
-        if (len >= sizeof(FILE_END_OF_FILE_INFORMATION))
-        {
-            const FILE_END_OF_FILE_INFORMATION *info = ptr;
-
-            SERVER_START_REQ( set_fd_eof_info )
-            {
-                req->handle   = wine_server_obj_handle( handle );
-                req->eof      = info->EndOfFile.QuadPart;
-                status = wine_server_call( req );
-            }
-            SERVER_END_REQ;
-        }
-        else status = STATUS_INVALID_PARAMETER_3;
-        break;
-
-    case FilePipeInformation:
-        if (len >= sizeof(FILE_PIPE_INFORMATION))
-        {
-            FILE_PIPE_INFORMATION *info = ptr;
-
-            if ((info->CompletionMode | info->ReadMode) & ~1)
-            {
-                status = STATUS_INVALID_PARAMETER;
-                break;
-            }
-
-            SERVER_START_REQ( set_named_pipe_info )
-            {
-                req->handle = wine_server_obj_handle( handle );
-                req->flags  = (info->CompletionMode ? NAMED_PIPE_NONBLOCKING_MODE    : 0) |
-                              (info->ReadMode       ? NAMED_PIPE_MESSAGE_STREAM_READ : 0);
-                status = wine_server_call( req );
-            }
-            SERVER_END_REQ;
-            /* madeira-pipe-state-fd-backed: a unix pipe wrapped as a file object is a pipe by device
-             * type but not a named-pipe object; the mode asked for is what it already is. */
-            if (status == STATUS_INVALID_HANDLE || status == STATUS_OBJECT_TYPE_MISMATCH)
-            {
-                FILE_FS_DEVICE_INFORMATION device;
-                IO_STATUS_BLOCK device_io;
-
-                if (!NtQueryVolumeInformationFile( handle, &device_io, &device, sizeof(device), FileFsDeviceInformation )
-                    && device.DeviceType == FILE_DEVICE_NAMED_PIPE)
-                    status = STATUS_SUCCESS;
-            }
-        }
-        else status = STATUS_INVALID_PARAMETER_3;
-        break;
-
-    case FileMailslotSetInformation:
-        {
-            FILE_MAILSLOT_SET_INFORMATION *info = ptr;
-
-            SERVER_START_REQ( set_mailslot_info )
-            {
-                req->handle = wine_server_obj_handle( handle );
-                req->flags = MAILSLOT_SET_READ_TIMEOUT;
-                req->read_timeout = info->ReadTimeout.QuadPart;
-                status = wine_server_call( req );
-            }
-            SERVER_END_REQ;
-        }
         break;
 
     case FileCompletionInformation:
@@ -5800,25 +6230,6 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             SERVER_END_REQ;
         }
         else status = STATUS_INVALID_PARAMETER_3;
-        break;
-
-    case FileIoCompletionNotificationInformation:
-        if (len >= sizeof(FILE_IO_COMPLETION_NOTIFICATION_INFORMATION))
-        {
-            FILE_IO_COMPLETION_NOTIFICATION_INFORMATION *info = ptr;
-
-            if (info->Flags & FILE_SKIP_SET_USER_EVENT_ON_FAST_IO)
-                FIXME( "FILE_SKIP_SET_USER_EVENT_ON_FAST_IO not supported\n" );
-
-            SERVER_START_REQ( set_fd_completion_mode )
-            {
-                req->handle   = wine_server_obj_handle( handle );
-                req->flags    = info->Flags;
-                status = wine_server_call( req );
-            }
-            SERVER_END_REQ;
-        }
-        else status = STATUS_INFO_LENGTH_MISMATCH;
         break;
 
     case FileIoPriorityHintInformation:
@@ -5843,9 +6254,6 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             struct stat st;
             const FILE_VALID_DATA_LENGTH_INFORMATION *info = ptr;
 
-            if ((status = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL )))
-                return io->Status = status;
-
             if (fstat( fd, &st ) == -1) status = errno_to_status( errno );
             else if (info->ValidDataLength.QuadPart <= 0 || (off_t)info->ValidDataLength.QuadPart > st.st_size)
                 status = STATUS_INVALID_PARAMETER;
@@ -5862,7 +6270,6 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 WARN( "setting valid data length not supported\n" );
 #endif
             }
-            if (needs_close) close( fd );
         }
         else status = STATUS_INVALID_PARAMETER_3;
         break;
@@ -5993,10 +6400,30 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         break;
 
     default:
-        FIXME("Unsupported class (%d)\n", class);
-        status = STATUS_NOT_IMPLEMENTED;
-        break;
+        if (needs_close) close( fd );
+        status = server_set_file_info( handle, io, ptr, len, class );
+        /* madeira-pipe-state-fd-backed: a unix pipe wrapped as a file object is a pipe by device
+         * type but not a named-pipe object; the mode asked for is what it already is.
+         * (Wine 11.22 moved FilePipeInformation to the server's set_file_info, whose default
+         * answer for such an object is STATUS_NOT_IMPLEMENTED.) */
+        if (class == FilePipeInformation &&
+            (status == STATUS_INVALID_HANDLE || status == STATUS_OBJECT_TYPE_MISMATCH ||
+             status == STATUS_NOT_IMPLEMENTED))
+        {
+            FILE_FS_DEVICE_INFORMATION device;
+            IO_STATUS_BLOCK device_io;
+
+            if (!NtQueryVolumeInformationFile( handle, &device_io, &device, sizeof(device), FileFsDeviceInformation )
+                && device.DeviceType == FILE_DEVICE_NAMED_PIPE)
+            {
+                io->Information = 0;
+                io->Status = status = STATUS_SUCCESS;
+            }
+        }
+        return status;
     }
+
+    if (needs_close) close( fd );
     io->Information = 0;
     return io->Status = status;
 }
@@ -6040,6 +6467,15 @@ struct async_irp
     struct async_fileio io;
     void               *buffer;   /* buffer for output */
     ULONG               size;     /* size of buffer */
+};
+
+struct async_scsi_pass_through_direct
+{
+    struct async_fileio io;
+    const void         *orig_input;
+    void               *orig_output;
+    void               *buffer;
+    ULONG               size;
 };
 
 static struct async_fileio *fileio_freelist;
@@ -6086,6 +6522,100 @@ static BOOL irp_completion( void *user, ULONG_PTR *info, unsigned int *status )
         }
         SERVER_END_REQ;
     }
+    release_fileio( &async->io );
+    return TRUE;
+}
+
+typedef struct _SCSI_PASS_THROUGH32
+{
+    USHORT Length;
+    UCHAR ScsiStatus;
+    UCHAR PathId;
+    UCHAR TargetId;
+    UCHAR Lun;
+    UCHAR CdbLength;
+    UCHAR SenseInfoLength;
+    UCHAR DataIn;
+    ULONG DataTransferLength;
+    ULONG TimeOutValue;
+    ULONG DataBufferOffset;
+    ULONG SenseInfoOffset;
+    UCHAR Cdb[16];
+} SCSI_PASS_THROUGH32;
+
+typedef struct _SCSI_PASS_THROUGH_DIRECT32
+{
+    USHORT Length;
+    UCHAR ScsiStatus;
+    UCHAR PathId;
+    UCHAR TargetId;
+    UCHAR Lun;
+    UCHAR CdbLength;
+    UCHAR SenseInfoLength;
+    UCHAR DataIn;
+    ULONG DataTransferLength;
+    ULONG TimeOutValue;
+    ULONG DataBuffer;
+    ULONG SenseInfoOffset;
+    UCHAR Cdb[16];
+} SCSI_PASS_THROUGH_DIRECT32;
+
+/* special callback for IOCTL_SCSI_PASS_THROUGH_DIRECT irp completion */
+static BOOL scsi_pass_through_direct_completion( void *user, ULONG_PTR *info, unsigned int *status )
+{
+    struct async_scsi_pass_through_direct *async = user;
+
+    if (*status == STATUS_ALERTED)
+    {
+        SERVER_START_REQ( get_async_result )
+        {
+            req->user_arg = wine_server_client_ptr( async );
+            wine_server_set_reply( req, async->buffer, async->size );
+            *status = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+
+        if (!NT_ERROR(*status))
+        {
+            if (in_wow64_call())
+            {
+                const SCSI_PASS_THROUGH_DIRECT32 *orig_input = async->orig_input;
+                SCSI_PASS_THROUGH_DIRECT32 *orig_output = async->orig_output;
+                const SCSI_PASS_THROUGH32 *output = async->buffer;
+                ULONG sense_offset = orig_input->SenseInfoOffset;
+                ULONG data_buffer = orig_input->DataBuffer;
+
+                memcpy( orig_output, output, sizeof(*orig_output) );
+                orig_output->SenseInfoOffset = sense_offset;
+                memcpy( (char *)orig_output + sense_offset, output + 1, output->SenseInfoLength );
+                orig_output->DataBuffer = data_buffer;
+                memcpy( UlongToPtr( data_buffer ), (char *)output + output->DataBufferOffset, output->DataTransferLength );
+                if (orig_output->SenseInfoLength)
+                    *info = orig_output->SenseInfoOffset + orig_output->SenseInfoLength;
+                else
+                    *info = sizeof(*orig_output);
+            }
+            else
+            {
+                const SCSI_PASS_THROUGH_DIRECT *orig_input = async->orig_input;
+                SCSI_PASS_THROUGH_DIRECT *orig_output = async->orig_output;
+                const SCSI_PASS_THROUGH *output = async->buffer;
+                ULONG sense_offset = orig_input->SenseInfoOffset;
+                void *data_buffer = orig_input->DataBuffer;
+
+                memcpy( orig_output, output, sizeof(*orig_output) );
+                orig_output->SenseInfoOffset = sense_offset;
+                memcpy( (char *)orig_output + sense_offset, output + 1, output->SenseInfoLength );
+                orig_output->DataBuffer = data_buffer;
+                memcpy( data_buffer, (char *)output + output->DataBufferOffset, output->DataTransferLength );
+                if (orig_output->SenseInfoLength)
+                    *info = orig_output->SenseInfoOffset + orig_output->SenseInfoLength;
+                else
+                    *info = sizeof(*orig_output);
+            }
+        }
+    }
+
     release_fileio( &async->io );
     return TRUE;
 }
@@ -6276,7 +6806,7 @@ static unsigned int server_read_file( HANDLE handle, HANDLE event, PIO_APC_ROUTI
     SERVER_START_REQ( read )
     {
         req->async = server_async( handle, &async->io, event, apc, apc_context, iosb_client_ptr(io) );
-        req->pos   = offset ? offset->QuadPart : 0;
+        req->pos   = offset ? offset->QuadPart : FILE_USE_FILE_POINTER_POSITION;
         wine_server_set_reply( req, buffer, size );
         status = virtual_locked_server_call( req );
         wait_handle = wine_server_ptr_handle( reply->wait );
@@ -6311,13 +6841,97 @@ static unsigned int server_write_file( HANDLE handle, HANDLE event, PIO_APC_ROUT
     SERVER_START_REQ( write )
     {
         req->async = server_async( handle, &async->io, event, apc, apc_context, iosb_client_ptr(io) );
-        req->pos   = offset ? offset->QuadPart : 0;
+        req->pos   = offset ? offset->QuadPart : FILE_USE_FILE_POINTER_POSITION;
         wine_server_add_data( req, buffer, size );
         status = wine_server_call( req );
         wait_handle = wine_server_ptr_handle( reply->wait );
         options     = reply->options;
         if (wait_handle && status != STATUS_PENDING)
             set_sync_iosb( io, status, reply->size, options );
+    }
+    SERVER_END_REQ;
+
+    if (status != STATUS_PENDING) free( async );
+
+    if (wait_handle) status = wait_async( wait_handle, (options & FILE_SYNCHRONOUS_IO_ALERT) );
+    return status;
+}
+
+
+/* IOCTL_SCSI_PASS_THROUGH_DIRECT has a pointer in it, so we convert it to
+ * IOCTL_SCSI_PASS_THROUGH */
+static NTSTATUS ioctl_scsi_pass_through_direct( HANDLE handle, HANDLE event,
+                                                PIO_APC_ROUTINE apc, void *apc_context,
+                                                IO_STATUS_BLOCK *io,
+                                                const void *in_buffer, UINT in_size,
+                                                void *out_buffer, UINT out_size )
+{
+    struct async_scsi_pass_through_direct *async;
+    struct async_fileio *fileio;
+    unsigned int status;
+    HANDLE wait_handle;
+    ULONG options;
+
+    if (!(fileio = alloc_fileio( sizeof(*async), scsi_pass_through_direct_completion )))
+        return STATUS_NO_MEMORY;
+    async = CONTAINING_RECORD( fileio, struct async_scsi_pass_through_direct, io );
+    async->orig_input = in_buffer;
+    async->orig_output = out_buffer;
+
+    if (in_wow64_call())
+    {
+        const SCSI_PASS_THROUGH_DIRECT32 *in_direct = in_buffer;
+        SCSI_PASS_THROUGH32 *input;
+
+        async->size = sizeof(*input) + in_direct->DataTransferLength + in_direct->SenseInfoLength;
+        if (!(input = malloc( async->size )))
+        {
+            free( fileio );
+            return STATUS_NO_MEMORY;
+        }
+        async->buffer = input;
+
+        /* The structures are bitwise identical except that the DataBuffer
+         * member is a pointer instead of a ULONG_PTR. */
+        memcpy( input, in_direct, sizeof(*input) );
+        input->SenseInfoOffset = sizeof(*input);
+        memcpy( input + 1, (char *)in_direct + in_direct->SenseInfoOffset, in_direct->SenseInfoLength );
+        input->DataBufferOffset = sizeof(*input) + input->SenseInfoLength;
+        memcpy( (char *)input + input->DataBufferOffset, UlongToPtr( in_direct->DataBuffer ), in_direct->DataTransferLength );
+    }
+    else
+    {
+        const SCSI_PASS_THROUGH_DIRECT *in_direct = in_buffer;
+        SCSI_PASS_THROUGH *input;
+
+        async->size = sizeof(*input) + in_direct->DataTransferLength + in_direct->SenseInfoLength;
+        if (!(input = malloc( async->size )))
+        {
+            free( fileio );
+            return STATUS_NO_MEMORY;
+        }
+        async->buffer = input;
+
+        /* The structures are bitwise identical except that the DataBuffer
+         * member is a pointer instead of a ULONG_PTR. */
+        memcpy( input, in_direct, sizeof(*input) );
+        input->SenseInfoOffset = sizeof(*input);
+        memcpy( input + 1, (char *)in_direct + in_direct->SenseInfoOffset, in_direct->SenseInfoLength );
+        input->DataBufferOffset = sizeof(*input) + input->SenseInfoLength;
+        memcpy( (char *)input + input->DataBufferOffset, in_direct->DataBuffer, in_direct->DataTransferLength );
+    }
+
+    SERVER_START_REQ( ioctl )
+    {
+        req->code        = IOCTL_SCSI_PASS_THROUGH;
+        req->async       = server_async( handle, fileio, event, apc, apc_context, iosb_client_ptr(io) );
+        wine_server_add_data( req, async->buffer, async->size );
+        wine_server_set_reply( req, async->buffer, async->size );
+        status = wine_server_call( req );
+        wait_handle = wine_server_ptr_handle( reply->wait );
+        options     = reply->options;
+        if (wait_handle && status != STATUS_PENDING)
+            set_sync_iosb( io, status, wine_server_reply_size( reply ), options );
     }
     SERVER_END_REQ;
 
@@ -6338,6 +6952,9 @@ static NTSTATUS server_ioctl_file( HANDLE handle, HANDLE event,
     unsigned int status;
     HANDLE wait_handle;
     ULONG options;
+
+    if (code == IOCTL_SCSI_PASS_THROUGH_DIRECT)
+        return ioctl_scsi_pass_through_direct( handle, event, apc, apc_context, io, in_buffer, in_size, out_buffer, out_size );
 
     if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion )))
         return STATUS_NO_MEMORY;
@@ -7118,16 +7735,65 @@ static int ios_guest_log_keep( const char *line, size_t len )
         "error", "fail", "exception", "unsupported", "not supported", "gpu", "driver",
         "adapter", "graphics", "monitor", "display", "nvapi", "nvidia",
     };
-    char lower[320];
+    char lower[320], *tag;
     size_t i;
 
     if (len >= sizeof(lower)) len = sizeof(lower) - 1;
     for (i = 0; i < len; i++)
         lower[i] = line[i] >= 'A' && line[i] <= 'Z' ? line[i] + ('a' - 'A') : line[i];
     lower[len] = 0;
+    /* ml2300: a "[DISPLAY]" log-level tag (a launcher's ordinary info lines) is not a
+     * display message; with it every line matched and its startup used the budget. */
+    for (tag = strchr( lower, '[' ); tag; tag = strchr( tag + 1, '[' ))
+    {
+        char *p = tag + 1, *end;
+        while (*p == ' ') p++;
+        if (strncmp( p, "display", 7 )) continue;
+        for (end = p + 7; *end == ' '; end++) ;
+        if (*end == ']') memset( tag, ' ', end + 1 - tag );
+    }
     for (i = 0; i < sizeof(words) / sizeof(words[0]); i++)
         if (strstr( lower, words[i] )) return 1;
     return 0;
+}
+
+/* ml2300: the value of a NAME=value whose name ends in password, token or secret is
+ * written as <redacted> (a store's one-use sign-in code is on a launcher's logged
+ * command line). Returns the length written to dst (at most capacity - 1). */
+static unsigned int ios_guest_log_redact( const char *src, unsigned int len, char *dst, unsigned int capacity )
+{
+    static const char *const keys[] = { "password=", "token=", "secret=" };
+    unsigned int i = 0, o = 0, k;
+
+    while (i < len && o + 1 < capacity)
+    {
+        for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+        {
+            unsigned int kl = strlen( keys[k] ), j;
+            if (i + kl > len) continue;
+            for (j = 0; j < kl; j++)
+            {
+                char c = src[i + j];
+                if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (c != keys[k][j]) break;
+            }
+            if (j == kl) break;
+        }
+        if (k == sizeof(keys) / sizeof(keys[0]))
+        {
+            dst[o++] = src[i++];
+            continue;
+        }
+        {
+            static const char mask[] = "<redacted>";
+            unsigned int kl = strlen( keys[k] ), m;
+            for (m = 0; m < kl && o + 1 < capacity; m++) dst[o++] = src[i++];
+            for (m = 0; mask[m] && o + 1 < capacity; m++) dst[o++] = mask[m];
+            while (i < len && src[i] != ' ' && src[i] != '\t' && src[i] != '"' && src[i] != '&') i++;
+        }
+    }
+    dst[o] = 0;
+    return o;
 }
 
 /* A BOM can be its own NtWriteFile call. Without one, require several ASCII
@@ -7208,7 +7874,7 @@ static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int lengt
     unsigned int i, n, start, serial;
     int saved_errno = errno, have_path = 0, m = __atomic_load_n( &mode, __ATOMIC_RELAXED );
     char path[PATH_MAX];
-    char decoded[4096];
+    char decoded[4096], clean[4096 + 16];
 
     if (m < 0)
     {
@@ -7289,12 +7955,13 @@ static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int lengt
         if (__atomic_exchange_n( &previous_hash, hash, __ATOMIC_RELAXED ) == hash) continue;
         serial = __atomic_fetch_add( &emitted, 1, __ATOMIC_RELAXED );
         if (serial >= __atomic_load_n( &limit, __ATOMIC_RELAXED )) break;
+        len = ios_guest_log_redact( (const char *)text + start, len, clean, sizeof(clean) );
         shown = len > 300 ? 300 : len;
         /* Keep a truncated UTF-8 line valid, including decoded UTF-16. */
         if (shown < len)
-            while (shown && (text[start + shown] & 0xc0) == 0x80) shown--;
+            while (shown && (clean[shown] & 0xc0) == 0x80) shown--;
         dprintf( 2, "[guest-log] #%u tid=%04x %.*s%s\n", serial + 1, (unsigned int)GetCurrentThreadId(),
-                 (int)shown, (const char *)text + start, shown < len ? " [truncated]" : "" );
+                 (int)shown, clean, shown < len ? " [truncated]" : "" );
     }
 out:
     errno = saved_errno;
@@ -7612,6 +8279,44 @@ NTSTATUS WINAPI NtWriteFileGather( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
         if (status != STATUS_PENDING && event) NtResetEvent( event, NULL );
     }
     return status;
+}
+
+
+static NTSTATUS server_set_file_info( HANDLE handle, IO_STATUS_BLOCK *io,
+                                      void *ptr, ULONG len, FILE_INFORMATION_CLASS class )
+{
+    struct async_irp *async;
+    HANDLE wait_handle;
+    NTSTATUS ret;
+
+    if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion )))
+        return STATUS_NO_MEMORY;
+    async->buffer  = NULL;
+    async->size    = 0;
+
+    SERVER_START_REQ( set_file_info )
+    {
+        req->async = server_async( handle, &async->io, NULL, NULL, NULL, iosb_client_ptr(io) );
+        req->handle = wine_server_obj_handle( handle );
+        req->info_class = class;
+        wine_server_add_data( req, ptr, len );
+        ret = wine_server_call( req );
+        wait_handle = wine_server_ptr_handle( reply->wait );
+        if (wait_handle && ret != STATUS_PENDING)
+        {
+            io->Status      = ret;
+            io->Information = 0;
+        }
+    }
+    SERVER_END_REQ;
+
+    if (ret != STATUS_PENDING) free( async );
+
+    if (wait_handle) ret = wait_async( wait_handle, FALSE );
+
+    if (ret == STATUS_NOT_IMPLEMENTED)
+        FIXME( "unimplemented class %#x\n", class );
+    return ret;
 }
 
 
@@ -8544,13 +9249,22 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
 
         if (get_mountmgr_fs_info( handle, fd, drive, sizeof(data) ))
         {
+#ifdef WINE_IOS
+            /* WoW64 callers only (see ios_wow_volume_serial): a prefix-stored
+             * serial and an empty label instead of an all-zero reply. */
+            if (NtCurrentTeb()->WowTebOffset && (info->VolumeSerialNumber = ios_wow_volume_serial( drive->letter )))
+            {
+                info->VolumeCreationTime.QuadPart = 0;
+                info->VolumeLabelLength = 0;
+                info->SupportsObjects = TRUE;
+                io->Information = offsetof( FILE_FS_VOLUME_INFORMATION, VolumeLabel );
+                status = STATUS_SUCCESS;
+                break;
+            }
+#endif
             /* fall back to an empty reply rather than failing */
             info->VolumeCreationTime.QuadPart = 0;
             info->VolumeSerialNumber = 0;
-#ifdef WINE_IOS
-            if (NtCurrentTeb() && NtCurrentTeb()->WowTebOffset)
-                info->VolumeSerialNumber = ios_wow_volume_serial( drive->letter );
-#endif
             info->VolumeLabelLength = 0;
             info->SupportsObjects = FALSE;
         }

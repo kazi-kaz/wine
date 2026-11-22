@@ -65,8 +65,9 @@
  * OPT-IN. The same pad is already visible through XInput, and without the
  * Windows marker that says "this DirectInput device is an XInput device" (the
  * IG_ PnP id games look up through WMI) a game that reads both APIs would see
- * two controllers. So the device is hidden unless MADEIRA_DINPUT_PAD=1 is in
- * the environment; see ios_dinput_pad_disabled.
+ * two controllers. So the device is hidden from any process that has an
+ * XInput DLL loaded, and shown to one that has none (dinput-auto, Nov 19);
+ * MADEIRA_DINPUT_PAD=1 / =0 force it either way. See ios_dinput_pad_disabled.
  *
  * NOT IMPLEMENTED, deliberately: force feedback. The vtbl's effect entries are
  * NULL, caps.dwFlags carries no DIDC_FORCEFEEDBACK, and
@@ -135,43 +136,71 @@ DEFINE_GUID( ios_joystick_guid, 0x9e573edc, 0x7734, 0x11d2, 0x8d, 0x4a, 0x23, 0x
  *
  * The axis contract is audited against Windows' XUSB DirectInput mapping (see
  * the comments on ios_logical_stick_inverted and ios_logical_triggers below).
- * The device is opt-in (MADEIRA_DINPUT_PAD=1, ios_dinput_pad_disabled), and an
+ * The device is shown by ios_dinput_pad_disabled (dinput-auto / MADEIRA_DINPUT_PAD), and an
  * opt-in, rate-limited trace (MADEIRA_DINPUT_TRACE=1, ios_joystick_trace)
  * reports the scaled state, the raw XInput sample it came from, the app's
  * DIPROP_RANGE/DEADZONE/SATURATION per object and the app's SetDataFormat
  * offsets, so a device report can name the object rather than guess at it. */
 static const char ios_joystick_build_tag[] =
-    "MADEIRA-DINPUT-IOS ml763-default-off axes=X,Y,Rx,Ry,Z(LT-RT) logical=-32768..32767 "
+    "MADEIRA-DINPUT-IOS ml763-dinput-auto axes=X,Y,Rx,Ry,Z(LT-RT) logical=-32768..32767 "
     "pov=0..7/idle8 pad-env=MADEIRA_DINPUT_PAD trace=state+raw+range+format@1Hz";
 
-/* Unless MADEIRA_DINPUT_PAD=1, this whole device is off: ios_joystick_enum_device
- * enumerates nothing, so EnumDevices and CreateDevice(ios_joystick_guid) (which
- * goes through enum_device too, see ios_joystick_create_device) both fail the
- * same way they would on a stock Wine with no winebus.sys device. Only a value
- * starting with '1' enables it; unset or anything else leaves it hidden.
- * The environment is read once into a cached atomic int, so it costs nothing
- * on the hot path after the first call; the ERR() is guarded by the
- * compare-exchange so only the thread that actually fills the cache logs it,
- * which is what makes "log once" true under concurrent enumeration. ERR rather
- * than TRACE because "why is my controller missing" should not require
- * WINEDEBUG=+dinput to see. */
-static int ios_dinput_pad_off = -1;
+/* When ios_dinput_pad_disabled says hidden, ios_joystick_enum_device
+ * enumerates nothing, so EnumDevices and CreateDevice(ios_joystick_guid) both
+ * fail the way they would on a stock Wine with no winebus.sys device.
+ * MADEIRA_DINPUT_PAD is read once into a cached atomic int; only auto mode
+ * (unset) does work per call (see dinput-auto below). ERR rather than TRACE
+ * because "why is my controller missing" should not require WINEDEBUG=+dinput. */
+static int ios_dinput_pad_off = -1;   /* MADEIRA_DINPUT_PAD=1 -> 0, =0 -> 1, unset -> 2 (auto) */
+
+/* dinput-auto (Nov 19): with MADEIRA_DINPUT_PAD UNSET the pad is shown to a
+ * process that has no XInput DLL loaded, and hidden from one that does. The
+ * double-pad worry above only applies to games that read both APIs; a game
+ * that never loads XInput (older DirectInput-only titles) otherwise sees no
+ * controller at all ("[dinput] iOS joystick hidden (default)"). Until it is
+ * first shown it is re-checked per enumeration (6 GetModuleHandleW calls);
+ * once shown it stays shown for the process.
+ * MADEIRA_DINPUT_PAD=0 keeps it hidden always (the old default); =1 shows it
+ * always. Logged once per answer change, so the log says which way it went. */
+static BOOL ios_process_has_xinput( void )
+{
+    static const WCHAR *const names[] =
+    {
+        L"xinput1_4.dll", L"xinput1_3.dll", L"xinput1_2.dll", L"xinput1_1.dll", L"xinput9_1_0.dll",
+        L"xinputuap.dll",
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+        if (GetModuleHandleW( names[i] )) return TRUE;
+    return FALSE;
+}
 
 static BOOL ios_dinput_pad_disabled( void )
 {
-    int off = __atomic_load_n( &ios_dinput_pad_off, __ATOMIC_RELAXED ), expect = -1;
+    static int last_auto = -1;
+    int off = __atomic_load_n( &ios_dinput_pad_off, __ATOMIC_RELAXED ), expect = -1, hide;
     const char *e;
 
-    if (off >= 0) return off;
+    if (off < 0)
+    {
+        e = getenv( "MADEIRA_DINPUT_PAD" );
+        off = !e || !e[0] ? 2 : (e[0] == '1' ? 0 : 1);
+        if (__atomic_compare_exchange_n( &ios_dinput_pad_off, &expect, off, 0,
+                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED ) && off == 1)
+            ERR( "[dinput] iOS joystick hidden (MADEIRA_DINPUT_PAD=%s)\n", debugstr_a(e) );
+    }
+    if (off != 2) return off;
 
-    /* Default OFF: see "OPT-IN" at the top of this file. MADEIRA_DINPUT_PAD=1
-     * turns the DirectInput view on for DirectInput-only games. */
-    e = getenv( "MADEIRA_DINPUT_PAD" );
-    off = (e && e[0] == '1') ? 0 : 1;
-    if (__atomic_compare_exchange_n( &ios_dinput_pad_off, &expect, off, 0,
-                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED ) && off)
-        ERR( "[dinput] iOS joystick hidden (default); MADEIRA_DINPUT_PAD=1 exposes it to DirectInput\n" );
-    return off;
+    /* Once shown, stay shown for this process: the app may already hold the
+     * GUID from EnumDevices, and CreateDevice must not then fail because an
+     * XInput DLL loaded in between. */
+    if (__atomic_load_n( &last_auto, __ATOMIC_RELAXED ) == 0) return FALSE;
+    hide = ios_process_has_xinput();
+    if (__atomic_exchange_n( &last_auto, hide, __ATOMIC_RELAXED ) != hide)
+        ERR( hide ? "[dinput] iOS joystick hidden: this game loaded XInput, which already has the pad (MADEIRA_DINPUT_PAD=1 shows it anyway)\n"
+                  : "[dinput] iOS joystick shown: no XInput DLL in this game (dinput-auto; MADEIRA_DINPUT_PAD=0 hides it)\n" );
+    return hide;
 }
 
 /* The four XInput user slots, as in XUSER_MAX_COUNT. Only slot 0 is exposed:
@@ -459,7 +488,7 @@ HRESULT ios_joystick_enum_device( DWORD type, DWORD flags, DIDEVICEINSTANCEW *in
      * is there to choose. */
     if (index != 0) return DIERR_DEVICENOTREG;
 
-    /* Opt-in (MADEIRA_DINPUT_PAD=1): see ios_dinput_pad_disabled. Checked before the
+    /* MADEIRA_DINPUT_PAD / dinput-auto: see ios_dinput_pad_disabled. Checked before the
      * pad-connected probe below so the kill switch works even with no
      * controller paired (a game that only checks "did EnumDevices find
      * anything" should see the same nothing either way). */

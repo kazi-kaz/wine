@@ -87,15 +87,22 @@ static const struct object_ops semaphore_sync_ops =
     .type         = &no_type,
     .dump         = semaphore_sync_dump,
 #ifdef WINE_IOS
+    /* ml1010: exactly as for an event -- these maintain cell->srv_waiters,
+     * which is the flag a client-side release reads to decide whether the
+     * server still has to be told to re-run its own wait queue.  The increment
+     * is visible before the server evaluates the count, because wait_on() adds
+     * every queue entry and only then does check_wait() call signaled(). */
     .add_queue    = semaphore_sync_add_queue,
     .remove_queue = semaphore_sync_remove_queue,
-    .destroy      = semaphore_sync_destroy,
 #else
     .add_queue    = add_queue,
     .remove_queue = remove_queue,
 #endif
     .signaled     = semaphore_sync_signaled,
     .satisfied    = semaphore_sync_satisfied,
+#ifdef WINE_IOS
+    .destroy      = semaphore_sync_destroy,
+#endif
 };
 
 #ifdef WINE_IOS

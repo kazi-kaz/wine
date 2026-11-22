@@ -42,8 +42,12 @@
 #include "devguid.h"
 #include "xinput.h"
 
-#include "wine/debug.h"
+/* Madeira (ml668): NtUserCallTwoParam_GetGamepadState and its inline wrapper.
+ * win32u.dll is in IMPORTS for this module and for every module that shares
+ * this source through PARENTSRC (xinput1_1/1_2/1_4/xinputuap). */
 #include "ntuser.h"
+
+#include "wine/debug.h"
 
 DEFINE_GUID(GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47,0x67,0x50,0xc5,0xe1,0xa6);
 
@@ -51,117 +55,6 @@ DEFINE_GUID(GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47
 #define XINPUT_GAMEPAD_GUIDE 0x0400
 
 WINE_DEFAULT_DEBUG_CHANNEL(xinput);
-
-/* Madeira/iOS: try the in-process host snapshot before starting the HID
- * discovery thread. Other platforms return zero and retain the HID path. */
-/* Per-index edge state for XInputGetKeystroke on the host path. The HID path
- * keeps the same thing in controller->last_keystroke; the host path has no
- * struct xinput_controller at all, so it needs its own. */
-static LONG host_enabled = TRUE;
-
-/* Is a pad connected in the host slot? For callers that need nothing else, so
- * they never run the XInputEnable handling below. */
-static BOOL host_pad_connected(DWORD index)
-{
-    XINPUT_STATE state;
-
-    if (index >= XUSER_MAX_COUNT) return FALSE;
-    return NtUserGetGamepadState(index, NtUserGamepadOp_State, &state);
-}
-
-/* Madeira (ml2114/ml2115): the program has called XInputEnable(FALSE). Many
- * programs do that from WM_ACTIVATEAPP when their window loses activation and
- * enable again when it comes back. At startup the port restores a window born
- * minimized and brings it to the front from its own thread, and those messages
- * can arrive unbalanced, leaving XInput disabled while the window is in front;
- * the program then reads a connected pad at rest for good. When the calling
- * process owns the foreground window the disable is taken as stale and the
- * live state is returned. win32u answers both questions (the switch is read
- * from the host environment there, so it applies to 32- and 64-bit processes
- * alike); MADEIRA_XINPUT_ENABLE_FOREGROUND=0, or a win32u without the query,
- * keeps the zeroed state. Each outcome is logged once per process. */
-static BOOL host_disable_is_stale(void)
-{
-    static LONG said_stale, said_zeroed;
-    DWORD flags = ~0u;
-
-    if (NtUserGetGamepadState(0, NtUserGamepadOp_Foreground, &flags))
-    {
-        if (!InterlockedExchange(&said_stale, 1))
-            ERR("[xinput] ml2115 XInput was disabled by the program, but its window is in front: "
-                "live state (MADEIRA_XINPUT_ENABLE_FOREGROUND=0 keeps it zeroed)\n");
-        return TRUE;
-    }
-    if (!InterlockedExchange(&said_zeroed, 1))
-        ERR("[xinput] ml2114 XInput disabled by the program: host pad state zeroed (%s)\n",
-            flags == ~0u ? "no foreground query in win32u" :
-            !(flags & NtUserGamepadForeground_Rule) ? "MADEIRA_XINPUT_ENABLE_FOREGROUND=0" :
-            "another process owns the foreground window");
-    return FALSE;
-}
-
-/* Fill state from the host slot. TRUE means a pad is connected there. */
-static BOOL host_pad_state(DWORD index, XINPUT_STATE *state)
-{
-    memset(state, 0, sizeof(*state));
-    if (index >= XUSER_MAX_COUNT) return FALSE;
-    if (!NtUserGetGamepadState(index, NtUserGamepadOp_State, state)) return FALSE;
-    if (!InterlockedCompareExchange(&host_enabled, 0, 0) && !host_disable_is_stale())
-        memset(&state->Gamepad, 0, sizeof(state->Gamepad));
-    return TRUE;
-}
-
-/* The last XInputSetState per host slot. XInputEnable(FALSE) silences the
- * motors and XInputEnable(TRUE) sends these again, as Windows does; while
- * disabled XInputSetState only records. The host plays them on the physical
- * controller; a win32u that does not know NtUserGamepadOp_SetVibration
- * answers 0, which is ignored. */
-static XINPUT_VIBRATION host_vibration[XUSER_MAX_COUNT];
-
-static void host_pad_vibrate(DWORD index)
-{
-    XINPUT_VIBRATION motors = {0};
-
-    if (InterlockedCompareExchange(&host_enabled, 0, 0)) motors = host_vibration[index];
-    NtUserGetGamepadState(index, NtUserGamepadOp_SetVibration, &motors);
-}
-
-/* Is the host publishing ANY pad? Deliberately not cached: a controller can be
- * paired halfway through a session, and four syscalls into a memory read is
- * cheaper than the staleness bug a cache would buy. */
-static BOOL host_pad_any(void)
-{
-    DWORD i;
-
-    for (i = 0; i < XUSER_MAX_COUNT; i++)
-        if (host_pad_connected(i)) return TRUE;
-    return FALSE;
-}
-
-/* ml2114: what a log needs to tell a launch where the program sees the pad
- * from one where it does not. XInputEnable calls (8 per process) and the
- * first state query per user index. */
-static void host_note_enable(BOOL enable)
-{
-    static LONG said;
-    DWORD flags = ~0u;
-
-    if (InterlockedIncrement(&said) > 8) return;
-    NtUserGetGamepadState(0, NtUserGamepadOp_Foreground, &flags);
-    ERR("[xinput] ml2114 XInputEnable(%d) slot0=%s foreground=%s\n", !!enable,
-        host_pad_connected(0) ? "connected" : "empty",
-        flags == ~0u ? "unknown" : (flags & NtUserGamepadForeground_Owner) ? "this process" : "another process");
-}
-
-static void host_note_query(DWORD index, const char *result)
-{
-    static LONG said[XUSER_MAX_COUNT];
-
-    if (index >= XUSER_MAX_COUNT || InterlockedExchange(&said[index], 1)) return;
-    ERR("[xinput] ml2114 first state query index=%lu: %s, XInput %s\n", index, result,
-        InterlockedCompareExchange(&host_enabled, 0, 0) ? "enabled" : "disabled");
-}
-
 
 struct xinput_controller
 {
@@ -208,6 +101,9 @@ static struct xinput_controller controllers[XUSER_MAX_COUNT];
 static HMODULE xinput_instance;
 static HANDLE start_event;
 static HANDLE update_event;
+
+static HKEY deviface_key;
+static HANDLE key_changed_event;
 
 static SRWLOCK state_lock = SRWLOCK_INIT;
 static XINPUT_STATE current_state[XUSER_MAX_COUNT];
@@ -635,6 +531,36 @@ static void update_controller_list(void)
 
     EnterCriticalSection(&xinput_cs);
 
+    if (deviface_key)
+    {
+        if (WaitForSingleObject(key_changed_event, 0) == WAIT_TIMEOUT)
+        {
+            LeaveCriticalSection(&xinput_cs);
+            return;
+        }
+        TRACE("key changed.\n");
+    }
+    else
+    {
+        WCHAR keystr[256];
+
+        swprintf(keystr, ARRAY_SIZE(keystr), L"System\\CurrentControlSet\\Control\\DeviceClasses\\{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+                 guid.Data1,
+                 guid.Data2, guid.Data3, guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
+                 guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+
+        if (RegOpenKeyW(HKEY_LOCAL_MACHINE, keystr, &deviface_key))
+        {
+            TRACE("Failed to open key %s.\n", debugstr_w(keystr));
+            LeaveCriticalSection(&xinput_cs);
+            return;
+        }
+        key_changed_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        TRACE("opened key %p, event %p.\n", deviface_key, key_changed_event);
+    }
+    if (RegNotifyChangeKeyValue(deviface_key, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, key_changed_event, TRUE))
+        ERR("RegNotifyChangeKeyValue failed.\n");
+
     set = SetupDiGetClassDevsW(&guid, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
     detail->cbSize = sizeof(*detail);
 
@@ -905,6 +831,116 @@ static void start_update_thread(void)
     InitOnceExecuteOnce(&init_once, start_update_thread_once, NULL, NULL);
 }
 
+/* Madeira/iOS: try the in-process host snapshot before starting the HID
+ * discovery thread. Other platforms return zero and retain the HID path. */
+/* (Wine 11.22: XInputGetKeystroke now derives its edges from
+ * xinput_get_state(), which tries the host slot first, so the host path no
+ * longer needs edge state of its own.) */
+static LONG host_enabled = TRUE;
+
+/* Is a pad connected in the host slot? For callers that need nothing else, so
+ * they never run the XInputEnable handling below. */
+static BOOL host_pad_connected(DWORD index)
+{
+    XINPUT_STATE state;
+
+    if (index >= XUSER_MAX_COUNT) return FALSE;
+    return NtUserGetGamepadState(index, NtUserGamepadOp_State, &state);
+}
+
+/* Madeira (ml2114/ml2115): the program has called XInputEnable(FALSE). Many
+ * programs do that from WM_ACTIVATEAPP when their window loses activation and
+ * enable again when it comes back. At startup the port restores a window born
+ * minimized and brings it to the front from its own thread, and those messages
+ * can arrive unbalanced, leaving XInput disabled while the window is in front;
+ * the program then reads a connected pad at rest for good. When the calling
+ * process owns the foreground window the disable is taken as stale and the
+ * live state is returned. win32u answers both questions (the switch is read
+ * from the host environment there, so it applies to 32- and 64-bit processes
+ * alike); MADEIRA_XINPUT_ENABLE_FOREGROUND=0, or a win32u without the query,
+ * keeps the zeroed state. Each outcome is logged once per process. */
+static BOOL host_disable_is_stale(void)
+{
+    static LONG said_stale, said_zeroed;
+    DWORD flags = ~0u;
+
+    if (NtUserGetGamepadState(0, NtUserGamepadOp_Foreground, &flags))
+    {
+        if (!InterlockedExchange(&said_stale, 1))
+            ERR("[xinput] ml2115 XInput was disabled by the program, but its window is in front: "
+                "live state (MADEIRA_XINPUT_ENABLE_FOREGROUND=0 keeps it zeroed)\n");
+        return TRUE;
+    }
+    if (!InterlockedExchange(&said_zeroed, 1))
+        ERR("[xinput] ml2114 XInput disabled by the program: host pad state zeroed (%s)\n",
+            flags == ~0u ? "no foreground query in win32u" :
+            !(flags & NtUserGamepadForeground_Rule) ? "MADEIRA_XINPUT_ENABLE_FOREGROUND=0" :
+            "another process owns the foreground window");
+    return FALSE;
+}
+
+/* Fill state from the host slot. TRUE means a pad is connected there. */
+static BOOL host_pad_state(DWORD index, XINPUT_STATE *state)
+{
+    memset(state, 0, sizeof(*state));
+    if (index >= XUSER_MAX_COUNT) return FALSE;
+    if (!NtUserGetGamepadState(index, NtUserGamepadOp_State, state)) return FALSE;
+    if (!InterlockedCompareExchange(&host_enabled, 0, 0) && !host_disable_is_stale())
+        memset(&state->Gamepad, 0, sizeof(state->Gamepad));
+    return TRUE;
+}
+
+/* The last XInputSetState per host slot. XInputEnable(FALSE) silences the
+ * motors and XInputEnable(TRUE) sends these again, as Windows does; while
+ * disabled XInputSetState only records. The host plays them on the physical
+ * controller; a win32u that does not know NtUserGamepadOp_SetVibration
+ * answers 0, which is ignored. */
+static XINPUT_VIBRATION host_vibration[XUSER_MAX_COUNT];
+
+static void host_pad_vibrate(DWORD index)
+{
+    XINPUT_VIBRATION motors = {0};
+
+    if (InterlockedCompareExchange(&host_enabled, 0, 0)) motors = host_vibration[index];
+    NtUserGetGamepadState(index, NtUserGamepadOp_SetVibration, &motors);
+}
+
+/* Is the host publishing ANY pad? Deliberately not cached: a controller can be
+ * paired halfway through a session, and four syscalls into a memory read is
+ * cheaper than the staleness bug a cache would buy. */
+static BOOL host_pad_any(void)
+{
+    DWORD i;
+
+    for (i = 0; i < XUSER_MAX_COUNT; i++)
+        if (host_pad_connected(i)) return TRUE;
+    return FALSE;
+}
+
+/* ml2114: what a log needs to tell a launch where the program sees the pad
+ * from one where it does not. XInputEnable calls (8 per process) and the
+ * first state query per user index. */
+static void host_note_enable(BOOL enable)
+{
+    static LONG said;
+    DWORD flags = ~0u;
+
+    if (InterlockedIncrement(&said) > 8) return;
+    NtUserGetGamepadState(0, NtUserGamepadOp_Foreground, &flags);
+    ERR("[xinput] ml2114 XInputEnable(%d) slot0=%s foreground=%s\n", !!enable,
+        host_pad_connected(0) ? "connected" : "empty",
+        flags == ~0u ? "unknown" : (flags & NtUserGamepadForeground_Owner) ? "this process" : "another process");
+}
+
+static void host_note_query(DWORD index, const char *result)
+{
+    static LONG said[XUSER_MAX_COUNT];
+
+    if (index >= XUSER_MAX_COUNT || InterlockedExchange(&said[index], 1)) return;
+    ERR("[xinput] ml2114 first state query index=%lu: %s, XInput %s\n", index, result,
+        InterlockedCompareExchange(&host_enabled, 0, 0) ? "enabled" : "disabled");
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     TRACE("inst %p, reason %lu, reserved %p.\n", inst, reason, reserved);
@@ -915,6 +951,19 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         xinput_instance = inst;
         DisableThreadLibraryCalls(inst);
         break;
+    case DLL_PROCESS_DETACH:
+    {
+        /* A game that exits with its motors running must not leave the host
+         * pad rumbling (Windows' driver stops them with the process); the
+         * host session outlives the game. */
+        XINPUT_VIBRATION off = {0};
+        DWORD i;
+
+        for (i = 0; i < XUSER_MAX_COUNT; i++)
+            if (host_vibration[i].wLeftMotorSpeed || host_vibration[i].wRightMotorSpeed)
+                NtUserGetGamepadState(i, NtUserGamepadOp_SetVibration, &off);
+        break;
+    }
     }
     return TRUE;
 }
@@ -929,6 +978,7 @@ void WINAPI DECLSPEC_HOTPATCH XInputEnable(BOOL enable)
     to the controllers. Setting to true will send the last vibration
     value (sent to XInputSetState) to the controller and allow messages to
     be sent */
+    host_note_enable(enable);
     InterlockedExchange(&host_enabled, !!enable);
     if (host_pad_any())
     {
@@ -967,8 +1017,6 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
 
     start_update_thread();
 
-    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
-
     EnterCriticalSection(&xinput_cs);
     if (!controllers[index].device) update_controller_list();
     if (!controllers[index].device)
@@ -987,6 +1035,7 @@ static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
     DWORD ret;
 
     if (!state) return ERROR_BAD_ARGUMENTS;
+
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
 
     /* ml668: the host pad first, and before start_update_thread() - see the
@@ -1000,13 +1049,17 @@ static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
 
     start_update_thread();
 
-    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
-    if (get_current_state(index, state)) return ERROR_SUCCESS;
+    if (get_current_state(index, state))
+    {
+        host_note_query(index, "connected (HID)");
+        return ERROR_SUCCESS;
+    }
 
     EnterCriticalSection(&xinput_cs);
     update_controller_list();
     ret = get_current_state(index, state) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
     LeaveCriticalSection(&xinput_cs);
+    host_note_query(index, ret ? "not connected" : "connected (HID)");
 
     return ret;
 }
@@ -1158,13 +1211,7 @@ static DWORD check_for_keystroke(const DWORD index, XINPUT_KEYSTROKE *keystroke)
         /* note: guide button does not send an event */
     };
 
-    if ((ret = xinput_get_state(index, &state)))
-    {
-        AcquireSRWLockExclusive(&keystroke_lock);
-        memset(last, 0, sizeof(*last));
-        ReleaseSRWLockExclusive(&keystroke_lock);
-        return ret;
-    }
+    if ((ret = xinput_get_state(index, &state))) return ret;
     AcquireSRWLockExclusive(&keystroke_lock);
 
     cur = &state.Gamepad;
@@ -1241,6 +1288,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetKeystroke(DWORD index, DWORD reserved, P
     TRACE("index %lu, reserved %lu, keystroke %p.\n", index, reserved, keystroke);
 
     if (index >= XUSER_MAX_COUNT && index != XUSER_INDEX_ANY) return ERROR_BAD_ARGUMENTS;
+    if (!keystroke) return ERROR_BAD_ARGUMENTS;
 
     if (index == XUSER_INDEX_ANY)
     {
@@ -1275,8 +1323,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetDSoundAudioDeviceGuids(DWORD index, GUID
           debugstr_guid(capture_guid));
 
     if (index >= XUSER_MAX_COUNT || !render_guid || !capture_guid) return ERROR_BAD_ARGUMENTS;
-
-    if (host_pad_connected(index)) return ERROR_NOT_SUPPORTED;
+    if (host_pad_connected(index)) return ERROR_NOT_SUPPORTED;   /* Madeira: host slot */
 
     EnterCriticalSection(&xinput_cs);
     ret = controllers[index].device ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
@@ -1356,8 +1403,6 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
     }
 
     start_update_thread();
-
-    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
 
     EnterCriticalSection(&xinput_cs);
     if (!controllers[index].device) update_controller_list();

@@ -650,8 +650,8 @@ NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
  */
 NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
-    NTSTATUS ret;
     HANDLE sem = get_semaphore( crit );
+    NTSTATUS ret = STATUS_SUCCESS;
 
     if (sem) ret = NtReleaseSemaphore( sem, 1, NULL );
     else
@@ -659,34 +659,29 @@ NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
         LONG *lock = (LONG *)&crit->LockSemaphore;
         InterlockedExchange( lock, 1 );
         RtlWakeAddressSingle( lock );
-        ret = STATUS_SUCCESS;
     }
-    /* iOS-Madeira ml671: [cs-raise] — Book of the Dead dies on an UNHANDLED
-     * c0000008 with flags=1 (EXCEPTION_NONCONTINUABLE). That flag is the
-     * discriminator: RtlRaiseStatus sets it, KiRaiseUserExceptionDispatcher
-     * does not -- which is why the ml669 [bad-close] probe on the NtClose path
-     * never fired. This is one of only two RtlRaiseStatus sites in sync.c, and
-     * thread 0114 was parked on a semaphore when it died.
+    /* iOS-Madeira ml671: [cs-raise] — Book of the Dead died on an UNHANDLED
+     * c0000008 with flags=1 (EXCEPTION_NONCONTINUABLE) raised from here when
+     * NtReleaseSemaphore failed: the section's backing semaphore was closed
+     * underneath a live critical section, a handle-lifetime bug.
      *
-     * If NtReleaseSemaphore returns STATUS_INVALID_HANDLE here, the section's
-     * backing semaphore was closed underneath a live critical section -- a
-     * handle-lifetime bug, and a general one. Log the section's full state
-     * before RtlRaiseException overwrites the exception address with its own.
-     * Deliberately does not suppress: converting this to a silent return would
-     * leave the lock permanently broken instead of loudly dead. */
+     * Wine 11.22 (06c0cb5c5 "ntdll: Ignore semaphore errors in
+     * RtlpUnWaitCriticalSection()") no longer raises, which is what Windows
+     * does. The log stays so the lifetime bug is still visible. */
     if (ret)
     {
         static LONG cs_raise_n;
         if (InterlockedIncrement( &cs_raise_n ) <= 16)
+        {
             ios_cs_report_bad( crit, "UnWait" );
-            ERR( "[cs-raise] ml671 UnWait status=%08x crit=%p sem=%p owner=%04lx "
+            ERR( "[cs-raise] ml671 UnWait status=%08x (ignored, as upstream) crit=%p sem=%p owner=%04lx "
                  "lock=%ld recursion=%ld caller=%p\n",
                  (unsigned int)ret, crit, crit->LockSemaphore,
                  HandleToULong(crit->OwningThread), (long)crit->LockCount,
                  (long)crit->RecursionCount, __builtin_return_address(0) );
+        }
     }
-    if (ret) RtlRaiseStatus( ret );
-    return ret;
+    return STATUS_SUCCESS;
 }
 
 
@@ -1375,6 +1370,143 @@ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size )
     return FALSE;
 }
 
+/* iOS-Madeira bnet-woa-recheck (bnettest16): bnettest15's unix-side recheck
+ * (log 0697ade8) caught 80 lost wake-ups but still froze: renderer tid 0520 sat
+ * 958 s on SRW lock+2 with the lock word 00000002 (owners 0 = FREE). The wake
+ * was lost BEFORE the unix wait began (release + wake ran between our compare
+ * and the futex wait, and the waker did not find our queue entry), so the unix
+ * snapshot already held the released value and never changed. Only this
+ * function knows the caller's `cmp`, so recheck here: with the Windows env
+ * variable MADEIRA_ALERT_RECHECK_MS=N (game config; default off) an INFINITE
+ * wait sleeps in N ms slices and, after each, returns SUCCESS (a spurious
+ * wake-up, which every caller handles) once *addr no longer equals *cmp. */
+static int ios_woa_rc = -1;
+static LONG ios_woa_lost_n;
+static int ios_woa_recheck_ms(void)
+{
+    int rc = ios_woa_rc;
+    if (rc < 0)
+    {
+        static const char name[] = "MADEIRA_ALERT_RECHECK_MS=";
+        const RTL_USER_PROCESS_PARAMETERS *pp = NtCurrentTeb()->Peb->ProcessParameters;
+        const WCHAR *p = pp ? pp->Environment : NULL;
+        int v = 0;
+        while (p && *p)
+        {
+            int i = 0;
+            while (name[i] && p[i] == (WCHAR)name[i]) i++;
+            if (!name[i])
+            {
+                const WCHAR *d = p + i;
+                while (*d >= '0' && *d <= '9' && v < 100000) v = v * 10 + (*d++ - '0');
+                break;
+            }
+            while (*p) p++;
+            p++;
+        }
+        if (v > 60000) v = 60000;
+        if (v && v < 20) v = 20;
+        rc = ios_woa_rc = v;
+        if (v) ERR( "[woa-recheck] on: INFINITE RtlWaitOnAddress re-compares every %d ms rev=bnet-woa-recheck\n", v );
+    }
+    return rc;
+}
+
+/* iOS-Madeira bnet-woa-split (diagnostic only, reads state, changes nothing):
+ * when [woa-lost] fires, say WHICH half of the wake path failed.
+ *   ours=queued   -> no waker ever dequeued this entry: the wake was never
+ *                    issued for this address, or went to another table/entry
+ *                    (or, for a condition variable, a legitimate wake-one of
+ *                    a sibling: check others=).
+ *   ours=dequeued -> a waker removed the entry and alerted our tid, but the
+ *                    alert never ended the unix wait: the unix alert/futex side.
+ * others= counts the other waiters still queued on the same address.  For a
+ * size-2 wait at (word+2) the whole SRW word is printed (exclusive_waiters in
+ * the low half, owners in the high half).  Off with MADEIRA_WOA_SPLIT=0 in the
+ * game config (default on whenever MADEIRA_ALERT_RECHECK_MS is set). */
+static int ios_woa_split = -1;
+static int ios_woa_split_on(void)
+{
+    if (ios_woa_split < 0)
+    {
+        static const char name[] = "MADEIRA_WOA_SPLIT=0";
+        const RTL_USER_PROCESS_PARAMETERS *pp = NtCurrentTeb()->Peb->ProcessParameters;
+        const WCHAR *p = pp ? pp->Environment : NULL;
+        int on = 1;
+        while (p && *p)
+        {
+            int i = 0;
+            while (name[i] && p[i] == (WCHAR)name[i]) i++;
+            if (!name[i] && !p[i]) { on = 0; break; }
+            while (*p) p++;
+            p++;
+        }
+        ios_woa_split = on;
+    }
+    return ios_woa_split;
+}
+
+static void ios_woa_split_note( LONG n, struct futex_queue *queue, struct futex_entry *ours,
+                                const void *addr, SIZE_T size )
+{
+    struct futex_entry *e;
+    int others = 0, ours_listed = 0;
+    BOOL queued = ReadPointerAcquire( (void * volatile *)&ours->addr ) != NULL;
+    ULONG word = 0;
+    BOOL have_word = FALSE;
+
+    spin_lock( &queue->lock );
+    if (queue->queue.next)
+    {
+        LIST_FOR_EACH_ENTRY( e, &queue->queue, struct futex_entry, entry )
+        {
+            if (e == ours) ours_listed = 1;
+            else if (e->addr == addr) others++;
+        }
+    }
+    spin_unlock( &queue->lock );
+
+    if (size == 2 && ((ULONG_PTR)addr & 3) == 2)
+    {
+        word = *(const volatile ULONG *)((const char *)addr - 2);
+        have_word = TRUE;
+    }
+    if (have_word)
+        ERR( "[woa-split] #%ld tid=%04lx addr=%p ours=%s listed=%d others=%d srw_word=%08lx rev=bnet-woa-split\n",
+             n, GetCurrentThreadId(), addr, queued ? "queued" : "dequeued", ours_listed, others, word );
+    else
+        ERR( "[woa-split] #%ld tid=%04lx addr=%p ours=%s listed=%d others=%d rev=bnet-woa-split\n",
+             n, GetCurrentThreadId(), addr, queued ? "queued" : "dequeued", ours_listed, others );
+
+    /* bnet-woa-late (bnettest23): a waker removed our entry, so its alert should be on the way.  Wait up
+     * to 50 ms more for it: "late" = the waker was only slow between dequeue and NtAlertThreadByThreadId;
+     * "LOST" = the alert never reached this thread's unix wait.  Also print the tid the waker used
+     * (GetCurrentThreadId, the id stored in our entry) next to the 64-bit TEB's id, which is the slot the
+     * unix wait sleeps on.  Consuming the late alert here also saves the next wait a spurious wake. */
+    if (!queued && ios_woa_split_on())
+    {
+        LARGE_INTEGER t0, t1, late;
+        NTSTATUS st;
+        ULONG tid64 = 0;
+#ifndef _WIN64
+        {
+            ULONG teb64 = NtCurrentTeb()->GdiBatchCount;   /* WoW64: guest address of the 64-bit TEB */
+            if (teb64) tid64 = *(const volatile ULONG *)ULongToPtr( teb64 + 0x48 );   /* TEB64.ClientId.UniqueThread */
+        }
+#else
+        tid64 = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+#endif
+        late.QuadPart = -50 * 10000;
+        NtQuerySystemTime( &t0 );
+        st = NtWaitForAlertByThreadId( addr, &late );
+        NtQuerySystemTime( &t1 );
+        ERR( "[woa-late] #%ld tid=%04lx teb64-tid=%04lx%s addr=%p -> %s after %ld us rev=bnet-woa-late\n",
+             n, GetCurrentThreadId(), tid64, tid64 && tid64 != GetCurrentThreadId() ? " **ID MISMATCH**" : "",
+             addr, st == STATUS_ALERTED ? "late alert ARRIVED" : "no alert within 50 ms (LOST or very late)",
+             (long)((t1.QuadPart - t0.QuadPart) / 10) );
+    }
+}
+
 /***********************************************************************
  *           RtlWaitOnAddress   (NTDLL.@)
  */
@@ -1428,7 +1560,33 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
     /* ml441: pass the real address — the unix layer ignores it functionally
      * but the [waiters] registry (ml440) records it, so long parks are now
      * attributable to a named lock word. */
-    ret = NtWaitForAlertByThreadId( addr, timeout );
+    if (!timeout && ios_woa_recheck_ms() > 0)
+    {
+        /* bnet-woa-recheck: finite slices, re-compare against the caller's value */
+        LARGE_INTEGER slice;
+        ULONG slices = 0;
+        slice.QuadPart = -(LONGLONG)ios_woa_recheck_ms() * 10000;
+        for (;;)
+        {
+            ret = NtWaitForAlertByThreadId( addr, &slice );
+            if (ret != STATUS_TIMEOUT) break;
+            slices++;
+            if (!compare_addr( addr, cmp, size ))
+            {
+                LONG n = InterlockedIncrement( &ios_woa_lost_n );
+                if (n <= 64 || !(n & 255))
+                {
+                    ERR( "[woa-lost] #%ld tid=%04lx addr=%p size=%Iu value changed with no wake after %lu ms; spurious wake returned rev=bnet-woa-recheck\n",
+                         n, GetCurrentThreadId(), addr, size, slices * (ULONG)ios_woa_recheck_ms() );
+                    if (ios_woa_split_on()) ios_woa_split_note( n, queue, &entry, addr, size );
+                }
+                ret = STATUS_SUCCESS;
+                break;
+            }
+        }
+    }
+    else
+        ret = NtWaitForAlertByThreadId( addr, timeout );
 
     if (NtCurrentTeb()->Instrumentation[10] == (void *)(ULONG_PTR)0x504d5550)
     {

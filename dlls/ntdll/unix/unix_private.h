@@ -21,10 +21,6 @@
 #ifndef __NTDLL_UNIX_PRIVATE_H
 #define __NTDLL_UNIX_PRIVATE_H
 
-#ifdef WINE_IOS
-#include "unix_private_ios.h"
-#else
-
 #include <pthread.h>
 #include <signal.h>
 #include "unixlib.h"
@@ -56,6 +52,7 @@ static const WORD current_machine = IMAGE_FILE_MACHINE_ARM64;
 #endif
 extern WORD native_machine;
 extern ULONG cpu_count;
+extern ULONG madeira_peb_cpu_count;  /* ml1122 */
 
 static const BOOL is_win64 = (sizeof(void *) > sizeof(int));
 
@@ -87,11 +84,36 @@ static inline WOW_TEB *get_wow_teb( TEB *teb )
     return teb->WowTebOffset ? (WOW_TEB *)((char *)teb + teb->WowTebOffset) : NULL;
 }
 
+#ifdef WINE_IOS
+/* MADEIRA: wow_peb is a SESSION global on iOS (pseudo-processes share one
+ * address space) and is cleared or swapped when another 32-bit process's window
+ * is released or a 64-bit child starts.  A 32-bit program still running then
+ * got is_wow64() == FALSE, get_cpu_area() NULL and STATUS_INVALID_PARAMETER
+ * from its own ThreadWow64Context query (its first thread was built on Esp 0,
+ * its callbacks on a stack at guest 0xffffffb0).  A thread whose own TEB
+ * carries a 32-bit TEB is WoW64 whatever the global says.
+ *
+ * ios_wow64_by_teb is provided by the Madeira iOS layer (MADEIRA_WOW64_BY_TEB=0
+ * sets it to 0).  It is a weak reference: without the Madeira symbol, and for
+ * every thread without a 32-bit TEB (every 64-bit thread), the answer is the
+ * global one, exactly as upstream. */
+extern int ios_wow64_by_teb __attribute__((weak));
+static inline BOOL is_wow64(void)
+{
+    if (&ios_wow64_by_teb && ios_wow64_by_teb)
+    {
+        TEB *teb = NtCurrentTeb();
+        if (teb && teb->WowTebOffset) return TRUE;
+    }
+    return !!wow_peb;
+}
+#else
 static inline BOOL is_wow64(void)
 {
     if (is_win64) return !is_machine_64bit( main_image_info.Machine ); /* 64-bit ntdll, 32-bit image */
     else return is_machine_64bit( native_machine );  /* 32-bit ntdll, 64-bit wineserver */
 }
+#endif
 
 /* check for old-style Wow64 (using a 32-bit ntdll.so) */
 static inline BOOL is_old_wow64(void)
@@ -107,8 +129,11 @@ static inline BOOL is_arm64ec(void)
 
 static inline ULONG_PTR get_system_affinity_mask(void)
 {
-    if (cpu_count >= sizeof(ULONG_PTR) * 8) return ~(ULONG_PTR)0;
-    return ((ULONG_PTR)1 << cpu_count) - 1;
+    /* Madeira ml1122: the mask follows the processor count the program is told (the PEB
+     * count), as it did before Wine 11.22 moved this helper off the PEB. */
+    ULONG count = madeira_peb_cpu_count ? madeira_peb_cpu_count : cpu_count;
+    if (count >= sizeof(ULONG_PTR) * 8) return ~(ULONG_PTR)0;
+    return ((ULONG_PTR)1 << count) - 1;
 }
 
 
@@ -223,6 +248,7 @@ extern USHORT *lctable;
 extern SIZE_T startup_info_size;
 extern BOOL is_prefix_bootstrap;
 extern ULONG session_id;
+extern ULONG64 mitigation_options[2];
 extern int main_argc;
 extern char **main_argv;
 extern WCHAR **main_wargv;
@@ -250,8 +276,15 @@ extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine
                               ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset );
 extern NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret );
 extern BOOL is_system_dir_path( const UNICODE_STRING *path, WORD *machine );
+#ifdef WINE_IOS
+/* Madeira: every pseudo-process loads its own main image in the one shared unix lib,
+ * so the image base is handed back to the caller instead of living in main_module. */
+extern NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **module );
+extern NTSTATUS load_start_exe( UNICODE_STRING *nt_name, void **module );
+#else
 extern NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine );
 extern NTSTATUS load_start_exe( UNICODE_STRING *nt_name );
+#endif
 extern ULONG_PTR redirect_arm64ec_rva( void *module, ULONG_PTR rva, const IMAGE_ARM64EC_METADATA *metadata );
 extern void start_server( BOOL debug );
 
@@ -330,6 +363,9 @@ extern NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_
                                             SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page );
 extern void virtual_map_user_shared_data(void);
 extern void virtual_init_user_shared_data(void);
+#ifdef WINE_IOS
+extern void madeira_kusd_fill_if_empty(void);
+#endif
 extern NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, void *stack );
 extern unsigned int virtual_locked_server_call( void *req_ptr );
 extern ssize_t virtual_locked_read( int fd, void *addr, size_t size );
@@ -397,6 +433,7 @@ extern NTSTATUS open_unix_file( HANDLE *handle, const char *unix_name, ACCESS_MA
                                 OBJECT_ATTRIBUTES *attr, ULONG attributes, ULONG sharing, ULONG disposition,
                                 ULONG options, void *ea_buffer, ULONG ea_length );
 extern NTSTATUS get_device_info( int fd, struct _FILE_FS_DEVICE_INFORMATION *info );
+extern void get_random( void *buf, ULONG len );
 extern void init_files(void);
 extern void init_cpu_info(void);
 extern void init_shared_data_cpuinfo( struct _KUSER_SHARED_DATA *data );
@@ -421,6 +458,13 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
 extern void dbg_init(void);
 
 extern void close_inproc_sync( HANDLE handle );
+#ifdef WINE_IOS
+/* Madeira fastsync (sync.c): drop a handle from the handle -> cell cache
+ * (from close_inproc_sync()), and drop a reissued process id's
+ * stale entries once at process init.  No-ops while fastsync is off. */
+extern void madeira_fast_close( HANDLE handle );
+extern void madeira_fast_flush_pid(void);
+#endif
 
 extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
                                           ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status );
@@ -522,8 +566,17 @@ static inline NTSTATUS wait_async( HANDLE handle, BOOL alertable )
     return server_wait_for_object( handle, alertable, NULL );
 }
 
+#ifdef WINE_IOS
+/* iOS: is the CURRENT pseudo-process a WoW64 one (the session global cannot
+ * answer that)?  Defined by the I/O status-block owner rule in file.c on the
+ * iOS build.  Weak: without it, upstream's answer. */
+extern BOOL ios_in_wow64_call(void) __attribute__((weak));
+#endif
 static inline BOOL in_wow64_call(void)
 {
+#ifdef WINE_IOS
+    if (ios_in_wow64_call) return ios_in_wow64_call();
+#endif
     return is_win64 && is_wow64();
 }
 
@@ -635,11 +688,23 @@ static inline void init_unicode_string( UNICODE_STRING *str, const WCHAR *data )
     str->Buffer = (WCHAR *)data;
 }
 
+#ifdef WINE_IOS
+/* Madeira iOS layer: the section mapping limit of the CURRENT pseudo-process
+ * (user_space_wow_limit is a session global there).  Weak: without it,
+ * upstream's limit. */
+extern ULONG_PTR ios_section_zero_bits(void) __attribute__((weak));
+#endif
+
 static inline NTSTATUS map_section( HANDLE mapping, void **ptr, SIZE_T *size, ULONG protect )
 {
+    ULONG_PTR zero_bits = user_space_wow_limit;
+
     *ptr = NULL;
     *size = 0;
-    return NtMapViewOfSection( mapping, NtCurrentProcess(), ptr, user_space_wow_limit,
+#ifdef WINE_IOS
+    if (ios_section_zero_bits) zero_bits = ios_section_zero_bits();
+#endif
+    return NtMapViewOfSection( mapping, NtCurrentProcess(), ptr, zero_bits,
                                0, NULL, size, ViewShare, 0, protect );
 }
 
@@ -741,7 +806,5 @@ static inline int is_gdt_sel( WORD sel )
 }
 
 #endif  /* defined(__i386__) || defined(__x86_64__) */
-
-#endif /* WINE_IOS */
 
 #endif /* __NTDLL_UNIX_PRIVATE_H */
